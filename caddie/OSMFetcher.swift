@@ -12,8 +12,12 @@ nonisolated func osmLog(_ message: @autoclosure () -> String) {
     #endif
 }
 
-enum OSMFetchOutcome {
-    case found(OSMCourse)
+/// Progressive stages emitted while fetching a course: the boundary lands first
+/// (from a cheap query) so it can paint immediately, then the full course with all
+/// features follows.
+enum OSMFetchStage {
+    case boundary(OSMCourse)
+    case complete(OSMCourse)
     case notFound
 }
 
@@ -25,52 +29,139 @@ enum OSMFetchError: Error {
 }
 
 actor OSMFetcher {
-    private let endpoint = URL(string: "https://overpass-api.de/api/interpreter")!
+    /// Public Overpass mirrors, tried in rotation. The working mirror is remembered
+    /// so subsequent requests start from the one that last succeeded.
+    private let endpoints: [URL] = [
+        URL(string: "https://overpass-api.de/api/interpreter")!,
+        URL(string: "https://overpass.kumi.systems/api/interpreter")!,
+        URL(string: "https://overpass.private.coffee/api/interpreter")!,
+    ]
+    private var endpointIndex = 0
     private let session: URLSession
     private let userAgent = "Caddie/1.0"
 
     private var inFlight: Set<String> = []
     private var lastRequestStartedAt: Date?
     private var minGap: TimeInterval = 1.0
+    private var lastRateLimitedAt: Date?
     private let baseMinGap: TimeInterval = 1.0
     private let maxMinGap: TimeInterval = 30.0
+    /// How long an elevated `minGap` takes to decay back to baseline once rate
+    /// limiting stops — so a single 429 doesn't penalize a much-later selection.
+    private let backoffDecay: TimeInterval = 60.0
 
     init(session: URLSession = .shared) {
         self.session = session
     }
 
-    /// Public entry point. Returns nil if a fetch is already in-flight for the identifier.
-    func fetch(identifier: String, name: String, latitude: Double, longitude: Double) async throws -> OSMFetchOutcome? {
-        guard !inFlight.contains(identifier) else { return nil }
+    /// Public entry point. Streams the boundary first, then the full course.
+    /// The stream finishes without emitting if a fetch is already in-flight.
+    nonisolated func fetch(identifier: String, name: String, latitude: Double, longitude: Double) -> AsyncThrowingStream<OSMFetchStage, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.runStagedFetch(
+                        identifier: identifier,
+                        name: name,
+                        latitude: latitude,
+                        longitude: longitude,
+                        yield: { continuation.yield($0) }
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Drives the two-stage fetch on the actor: dedup + throttle, then a cheap
+    /// boundary query followed by the full features query.
+    private func runStagedFetch(
+        identifier: String,
+        name: String,
+        latitude: Double,
+        longitude: Double,
+        yield: @Sendable (OSMFetchStage) -> Void
+    ) async throws {
+        guard !inFlight.contains(identifier) else { return }
         inFlight.insert(identifier)
         defer { inFlight.remove(identifier) }
 
         try await waitForGap()
         lastRequestStartedAt = .now
 
-        let query = buildQuery(name: name, latitude: latitude, longitude: longitude)
-        let response: OverpassResponse
+        // Stage A — boundary only. Small, single-feature query that paints fast.
+        let boundaryResponse = try await post(boundaryQuery(name: name, latitude: latitude, longitude: longitude))
+        guard let boundaryCourse = OSMCourseBuilder.makeCourse(from: boundaryResponse) else {
+            yield(.notFound)
+            return
+        }
+        yield(.boundary(boundaryCourse))
+
+        // Stage B — the full course with every golf feature.
+        let fullResponse = try await post(fullQuery(name: name, latitude: latitude, longitude: longitude))
+        yield(.complete(OSMCourseBuilder.makeCourse(from: fullResponse) ?? boundaryCourse))
+    }
+
+    /// Posts a query and adjusts throttling: relax on success, back off on rate limit.
+    private func post(_ query: String) async throws -> OverpassResponse {
         do {
-            response = try await postOverpass(query: query)
+            let response = try await postWithFailover(query: query)
+            minGap = max(baseMinGap, minGap / 2)
+            return response
         } catch OSMFetchError.rateLimited(let retryAfter) {
+            lastRateLimitedAt = .now
             minGap = min(maxMinGap, max(minGap * 2, retryAfter ?? minGap * 2))
             throw OSMFetchError.rateLimited(retryAfter: retryAfter)
         }
+    }
 
-        // Successful response — relax throttling back toward baseline.
-        minGap = max(baseMinGap, minGap / 2)
-
-        if let course = OSMCourseBuilder.makeCourse(from: response) {
-            return .found(course)
+    /// Tries each mirror in rotation starting from the last working one. Rotates on
+    /// rate-limit or transport failure; surfaces the error only when every mirror
+    /// has been exhausted.
+    private func postWithFailover(query: String) async throws -> OverpassResponse {
+        var lastError: Error = OSMFetchError.transport(underlying: URLError(.cannotConnectToHost))
+        for offset in 0..<endpoints.count {
+            let index = (endpointIndex + offset) % endpoints.count
+            do {
+                let response = try await postOverpass(query: query, endpoint: endpoints[index])
+                endpointIndex = index // remember the working mirror
+                return response
+            } catch OSMFetchError.rateLimited(let retryAfter) {
+                lastError = OSMFetchError.rateLimited(retryAfter: retryAfter)
+                osmLog("mirror \(endpoints[index].host ?? "?") rate limited, trying next")
+            } catch OSMFetchError.transport(let underlying) {
+                lastError = OSMFetchError.transport(underlying: underlying)
+                osmLog("mirror \(endpoints[index].host ?? "?") transport error, trying next")
+            }
         }
-        return .notFound
+        throw lastError
     }
 
     // MARK: - Query construction
 
-    private func buildQuery(name: String, latitude: Double, longitude: Double) -> String {
-        let bbox = boundingBox(latitude: latitude, longitude: longitude, kilometers: 2.0)
-        let bboxString = "\(bbox.south),\(bbox.west),\(bbox.north),\(bbox.east)"
+    /// Cheap query: just the course boundary way/relation, geometry inlined.
+    private func boundaryQuery(name: String, latitude: Double, longitude: Double) -> String {
+        let bboxString = bboxString(latitude: latitude, longitude: longitude)
+        let namePattern = escapeForOverpassRegex(simplifyName(name))
+
+        return """
+        [out:json][timeout:30];
+        (
+          way["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
+          relation["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
+        );
+        out geom;
+        """
+    }
+
+    /// Full query: the course plus every golf feature INSIDE the course polygon.
+    /// Uses `map_to_area` so interior holes/greens (far from the boundary line) are
+    /// included — `around.course:N` only catches features near the perimeter.
+    private func fullQuery(name: String, latitude: Double, longitude: Double) -> String {
+        let bboxString = bboxString(latitude: latitude, longitude: longitude)
         let namePattern = escapeForOverpassRegex(simplifyName(name))
 
         return """
@@ -79,16 +170,21 @@ actor OSMFetcher {
           way["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
           relation["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
         )->.course;
+        .course map_to_area->.courseArea;
         (
           .course;
-          way(around.course:50)["golf"];
-          node(around.course:50)["golf"];
-          relation(around.course:50)["golf"];
+          way(area.courseArea)["golf"];
+          node(area.courseArea)["golf"];
+          relation(area.courseArea)["golf"];
+          node(area.courseArea)["natural"="tree"];
         );
-        out body;
-        >;
-        out skel qt;
+        out geom;
         """
+    }
+
+    private func bboxString(latitude: Double, longitude: Double) -> String {
+        let bbox = boundingBox(latitude: latitude, longitude: longitude, kilometers: 4.0)
+        return "\(bbox.south),\(bbox.west),\(bbox.north),\(bbox.east)"
     }
 
     private func boundingBox(latitude: Double, longitude: Double, kilometers: Double) -> (north: Double, south: Double, east: Double, west: Double) {
@@ -132,7 +228,7 @@ actor OSMFetcher {
 
     // MARK: - Network
 
-    private func postOverpass(query: String) async throws -> OverpassResponse {
+    private func postOverpass(query: String, endpoint: URL) async throws -> OverpassResponse {
         osmLog("POST \(endpoint.absoluteString) query bytes=\(query.count)")
         osmLog("query:\n\(query)")
 
@@ -189,11 +285,24 @@ actor OSMFetcher {
     // MARK: - Throttling
 
     private func waitForGap() async throws {
+        decayBackoff()
         guard let last = lastRequestStartedAt else { return }
         let elapsed = Date().timeIntervalSince(last)
         let remaining = minGap - elapsed
         if remaining > 0 {
             try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
         }
+    }
+
+    /// Linearly relaxes an elevated `minGap` back toward baseline based on how long
+    /// it has been since the last rate limit, so an old 429 doesn't keep stalling
+    /// selections the user makes minutes later.
+    private func decayBackoff() {
+        guard minGap > baseMinGap, let rateLimited = lastRateLimitedAt else { return }
+        let elapsed = Date().timeIntervalSince(rateLimited)
+        guard elapsed > 0 else { return }
+        let fraction = min(1.0, elapsed / backoffDecay)
+        minGap = max(baseMinGap, minGap - (minGap - baseMinGap) * fraction)
+        if minGap <= baseMinGap { lastRateLimitedAt = nil }
     }
 }

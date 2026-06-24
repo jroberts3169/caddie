@@ -20,10 +20,14 @@ if [[ "${1:-}" == "clean" ]]; then
   exit 0
 fi
 
-CONFIG="${1:-Release}"
+CONFIG="${1:-Debug}"
 BUILD_DIR="build/$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')"
 
+# Always: quit the running app, clean, build, then launch.
 quit_app
+
+echo "Cleaning build/ and .derived/…"
+rm -rf build .derived
 
 echo "Building $SCHEME ($CONFIG)…"
 
@@ -45,10 +49,8 @@ APP="$BUILD_DIR/$CONFIG/$SCHEME.app"
 
 if [[ -d "$APP" ]]; then
   echo "Built: $APP"
-  if [[ "${2:-}" == "--run" ]]; then
-    echo "Launching ${SCHEME}…"
-    open "$APP"
-  fi
+  echo "Launching ${SCHEME}…"
+  open "$APP"
 else
   echo "Build succeeded but app not found at expected path: $APP" >&2
   exit 1

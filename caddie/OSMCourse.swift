@@ -20,7 +20,41 @@ nonisolated struct OSMCourse: Codable, Hashable {
     let boundary: [Coordinate]
     let holes: [OSMHole]
     let features: [OSMFeature]
-    let raw: OverpassResponse
+    let trees: [Coordinate]
+
+    init(
+        osmIdentifier: Int64,
+        osmType: String,
+        name: String?,
+        tags: [String: String],
+        boundary: [Coordinate],
+        holes: [OSMHole],
+        features: [OSMFeature],
+        trees: [Coordinate]
+    ) {
+        self.osmIdentifier = osmIdentifier
+        self.osmType = osmType
+        self.name = name
+        self.tags = tags
+        self.boundary = boundary
+        self.holes = holes
+        self.features = features
+        self.trees = trees
+    }
+
+    // Custom decoder so rows cached before `trees` existed still load (the key
+    // defaults to empty rather than failing the whole decode).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        osmIdentifier = try c.decode(Int64.self, forKey: .osmIdentifier)
+        osmType = try c.decode(String.self, forKey: .osmType)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        tags = try c.decode([String: String].self, forKey: .tags)
+        boundary = try c.decode([Coordinate].self, forKey: .boundary)
+        holes = try c.decode([OSMHole].self, forKey: .holes)
+        features = try c.decode([OSMFeature].self, forKey: .features)
+        trees = try c.decodeIfPresent([Coordinate].self, forKey: .trees) ?? []
+    }
 }
 
 nonisolated struct OSMHole: Codable, Hashable {
@@ -109,7 +143,8 @@ nonisolated struct OverpassNode: Codable, Hashable {
 nonisolated struct OverpassWay: Codable, Hashable {
     let type: String
     let id: Int64
-    let nodes: [Int64]
+    let nodes: [Int64]?
+    let geometry: [Coordinate]?
     let tags: [String: String]?
 }
 
@@ -124,6 +159,7 @@ nonisolated struct OverpassMember: Codable, Hashable {
     let type: String
     let ref: Int64
     let role: String
+    let geometry: [Coordinate]?
 }
 
 // MARK: - Domain conversion
@@ -155,20 +191,21 @@ nonisolated enum OSMCourseBuilder {
                 boundary: boundary,
                 holes: holes(from: waysByID, nodesByID: nodesByID),
                 features: features(from: waysByID, nodesByID: nodesByID),
-                raw: response
+                trees: trees(from: nodesByID, boundary: boundary)
             )
         }
 
         if let way = waysByID.values.first(where: { ($0.tags?["leisure"]) == "golf_course" }) {
+            let boundary = coordinates(for: way, nodesByID: nodesByID)
             return OSMCourse(
                 osmIdentifier: way.id,
                 osmType: "way",
                 name: way.tags?["name"],
                 tags: way.tags ?? [:],
-                boundary: coordinates(for: way, nodesByID: nodesByID),
+                boundary: boundary,
                 holes: holes(from: waysByID, nodesByID: nodesByID),
                 features: features(from: waysByID, nodesByID: nodesByID),
-                raw: response
+                trees: trees(from: nodesByID, boundary: boundary)
             )
         }
 
@@ -176,7 +213,12 @@ nonisolated enum OSMCourseBuilder {
     }
 
     private static func coordinates(for way: OverpassWay, nodesByID: [Int64: OverpassNode]) -> [Coordinate] {
-        way.nodes.compactMap { id in
+        // `out geom` inlines vertex coordinates directly on the way; fall back to
+        // resolving node references for responses that only carry a node table.
+        if let geometry = way.geometry, !geometry.isEmpty {
+            return geometry
+        }
+        return (way.nodes ?? []).compactMap { id in
             nodesByID[id].map { Coordinate(lat: $0.lat, lon: $0.lon) }
         }
     }
@@ -186,11 +228,54 @@ nonisolated enum OSMCourseBuilder {
         waysByID: [Int64: OverpassWay],
         nodesByID: [Int64: OverpassNode]
     ) -> [Coordinate] {
-        // Concatenate the outer-ring ways; not a full ring-stitch but good enough for a single closed boundary.
-        relation.members
+        // OSM splits a large outer boundary across multiple ways stored in arbitrary
+        // order and direction. Stitch them into a single ordered ring by matching
+        // shared endpoints; blindly concatenating them yields crossing edges and a
+        // self-intersecting polygon that renders as jagged wedges.
+        //
+        // With `out geom` the relation's member ways carry their geometry inline, so
+        // prefer that and fall back to the way table for node-reference responses.
+        let segments = relation.members
             .filter { $0.type == "way" && ($0.role == "outer" || $0.role.isEmpty) }
-            .compactMap { waysByID[$0.ref] }
-            .flatMap { coordinates(for: $0, nodesByID: nodesByID) }
+            .map { member -> [Coordinate] in
+                if let geometry = member.geometry, !geometry.isEmpty {
+                    return geometry
+                }
+                return waysByID[member.ref].map { coordinates(for: $0, nodesByID: nodesByID) } ?? []
+            }
+        return stitchRing(from: segments)
+    }
+
+    /// Greedily connects boundary segments end-to-end, reversing a segment when its
+    /// matching endpoint faces the wrong way, until no further segment connects.
+    private static func stitchRing(from segments: [[Coordinate]]) -> [Coordinate] {
+        var remaining = segments.filter { $0.count >= 2 }
+        guard !remaining.isEmpty else { return [] }
+
+        var ring = remaining.removeFirst()
+
+        while !remaining.isEmpty {
+            guard let ringStart = ring.first, let ringEnd = ring.last else { break }
+
+            let match = remaining.enumerated().first { _, seg in
+                seg.first == ringEnd || seg.last == ringEnd ||
+                seg.first == ringStart || seg.last == ringStart
+            }
+            guard let (index, seg) = match else { break }
+            remaining.remove(at: index)
+
+            if seg.first == ringEnd {
+                ring.append(contentsOf: seg.dropFirst())
+            } else if seg.last == ringEnd {
+                ring.append(contentsOf: seg.reversed().dropFirst())
+            } else if seg.last == ringStart {
+                ring.insert(contentsOf: seg.dropLast(), at: 0)
+            } else { // seg.first == ringStart
+                ring.insert(contentsOf: seg.reversed().dropLast(), at: 0)
+            }
+        }
+
+        return ring
     }
 
     private static func holes(from waysByID: [Int64: OverpassWay], nodesByID: [Int64: OverpassNode]) -> [OSMHole] {
@@ -223,5 +308,36 @@ nonisolated enum OSMCourseBuilder {
                 tags: way.tags ?? [:]
             )
         }
+    }
+
+    /// Collects `natural=tree` node positions, keeping only those that fall inside
+    /// the course boundary polygon. The Overpass bbox is wider than the course, so
+    /// this filter drops trees that belong to neighbouring streets/parks.
+    private static func trees(from nodesByID: [Int64: OverpassNode], boundary: [Coordinate]) -> [Coordinate] {
+        guard boundary.count >= 3 else { return [] }
+        return nodesByID.values
+            .filter { ($0.tags?["natural"]) == "tree" }
+            .map { Coordinate(lat: $0.lat, lon: $0.lon) }
+            .filter { isInside($0, polygon: boundary) }
+    }
+
+    /// Ray-casting point-in-polygon test. Treats lon as x and lat as y.
+    private static func isInside(_ point: Coordinate, polygon: [Coordinate]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        var inside = false
+        var j = polygon.count - 1
+        for i in 0..<polygon.count {
+            let a = polygon[i]
+            let b = polygon[j]
+            if (a.lat > point.lat) != (b.lat > point.lat) {
+                let slope = (point.lat - a.lat) / (b.lat - a.lat)
+                let intersectLon = a.lon + slope * (b.lon - a.lon)
+                if point.lon < intersectLon {
+                    inside.toggle()
+                }
+            }
+            j = i
+        }
+        return inside
     }
 }
