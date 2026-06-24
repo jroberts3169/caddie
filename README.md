@@ -8,16 +8,19 @@ the background.
 
 ## Table of Contents
 
-- [Features](#features)
-- [Screenshots](#screenshots)
-- [Requirements](#requirements)
-- [Getting Started](#getting-started)
-- [Architecture](#architecture)
-  - [Data Models](#data-models)
-  - [OpenStreetMap Integration](#openstreetmap-integration)
-- [Project Structure](#project-structure)
-- [Documentation](#documentation)
-- [Roadmap](#roadmap)
+- [Caddie](#caddie)
+  - [Table of Contents](#table-of-contents)
+  - [Features](#features)
+  - [Screenshots](#screenshots)
+  - [Requirements](#requirements)
+  - [Getting Started](#getting-started)
+    - [Debug logging](#debug-logging)
+  - [Architecture](#architecture)
+    - [Data Models](#data-models)
+    - [OpenStreetMap Integration](#openstreetmap-integration)
+  - [Project Structure](#project-structure)
+  - [Documentation](#documentation)
+  - [Roadmap](#roadmap)
 
 ## Features
 
@@ -37,16 +40,11 @@ the background.
 
 ## Requirements
 
-- macOS 15 (Sequoia) or later
-- Xcode 16 or later
+- macOS 26
+- Xcode 26
 - Swift 6
 
 ## Getting Started
-
-1. Clone the repository.
-2. Open `caddie.xcodeproj` in Xcode.
-3. Select the **caddie** scheme and a **My Mac** run destination.
-4. Build and run (`⌘R`).
 
 No API keys or accounts are required. The OpenStreetMap data comes from the
 public [Overpass API](https://overpass-api.de/), which Caddie queries politely
