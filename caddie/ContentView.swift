@@ -367,7 +367,9 @@ struct ContentView: View {
         let existing = try? modelContext.fetch(descriptor).first
 
         let successTTL: TimeInterval = 60 * 60 * 24 * 30
-        let errorTTL: TimeInterval = 60 * 60
+        // Short error window: a transient failure (e.g. a rate-limited mirror)
+        // should be retried soon, not frozen out for an hour.
+        let errorTTL: TimeInterval = 60 * 2
 
         if let existing {
             let age = Date().timeIntervalSince(existing.fetchedAt)
@@ -382,6 +384,10 @@ struct ContentView: View {
             case "error" where age < errorTTL:
                 osmLog("cache hit (error within TTL), skipping fetch")
                 return
+            case "partial":
+                // Boundary is cached (and already drawn via cachedCourse), but the
+                // feature stage never completed — always refetch to finish it.
+                osmLog("cache partial, refetching to complete features")
             default:
                 osmLog("cache stale, refetching")
             }
@@ -389,6 +395,8 @@ struct ContentView: View {
             osmLog("no cache row, fetching")
         }
 
+        // Track the boundary so a Stage B failure can still persist Stage A's result.
+        var boundaryCourse: OSMCourse?
         do {
             osmLog("calling fetcher.fetch")
             beginLoading(id)
@@ -402,6 +410,7 @@ struct ContentView: View {
                 switch stage {
                 case .boundary(let osmCourse):
                     osmLog("stage boundary id=\(id) points=\(osmCourse.boundary.count)")
+                    boundaryCourse = osmCourse
                     applyOutline(from: osmCourse, for: course)
                 case .complete(let osmCourse):
                     let encoded = try JSONEncoder().encode(osmCourse)
@@ -417,7 +426,19 @@ struct ContentView: View {
             }
         } catch {
             osmLog("error id=\(id) name=\(course.name): \(error)")
-            upsertOSMData(courseIdentifier: id, encoded: nil, status: "error", existing: existing)
+            if let boundaryCourse, let encoded = try? JSONEncoder().encode(boundaryCourse) {
+                // Stage A succeeded before the failure — keep the boundary so the
+                // course still renders its outline and refetches features next time.
+                osmCache[id] = boundaryCourse
+                upsertOSMData(courseIdentifier: id, encoded: encoded, status: "partial", existing: existing)
+            } else if case OSMFetchError.rateLimited = error {
+                // Transient: don't poison the cache. Leave any existing row intact
+                // (or none) so the next selection retries immediately.
+            } else if case OSMFetchError.transport = error {
+                // Transient (offline / mirror down): same — allow an immediate retry.
+            } else {
+                upsertOSMData(courseIdentifier: id, encoded: nil, status: "error", existing: existing)
+            }
         }
     }
 

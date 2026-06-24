@@ -190,7 +190,7 @@ nonisolated enum OSMCourseBuilder {
                 tags: relation.tags ?? [:],
                 boundary: boundary,
                 holes: holes(from: waysByID, nodesByID: nodesByID),
-                features: features(from: waysByID, nodesByID: nodesByID),
+                features: features(from: waysByID, relationsByID: relationsByID, nodesByID: nodesByID),
                 trees: trees(from: nodesByID, boundary: boundary)
             )
         }
@@ -204,7 +204,7 @@ nonisolated enum OSMCourseBuilder {
                 tags: way.tags ?? [:],
                 boundary: boundary,
                 holes: holes(from: waysByID, nodesByID: nodesByID),
-                features: features(from: waysByID, nodesByID: nodesByID),
+                features: features(from: waysByID, relationsByID: relationsByID, nodesByID: nodesByID),
                 trees: trees(from: nodesByID, boundary: boundary)
             )
         }
@@ -294,20 +294,55 @@ nonisolated enum OSMCourseBuilder {
             .sorted { ($0.ref ?? "") < ($1.ref ?? "") }
     }
 
-    private static func features(from waysByID: [Int64: OverpassWay], nodesByID: [Int64: OverpassNode]) -> [OSMFeature] {
-        waysByID.values.compactMap { way in
-            guard let golfTag = way.tags?["golf"], golfTag != "hole", golfTag != "golf_course" else { return nil }
+    private static func features(
+        from waysByID: [Int64: OverpassWay],
+        relationsByID: [Int64: OverpassRelation],
+        nodesByID: [Int64: OverpassNode]
+    ) -> [OSMFeature] {
+        var result: [OSMFeature] = []
+
+        // Way features: a single ring/line per way.
+        for way in waysByID.values {
+            guard let golfTag = way.tags?["golf"], golfTag != "hole", golfTag != "golf_course" else { continue }
             let kind = OSMFeature.Kind(rawValue: golfTag) ?? .unknown
             let coords = coordinates(for: way, nodesByID: nodesByID)
             let isClosed = coords.count > 2 && coords.first == coords.last
-            return OSMFeature(
+            result.append(OSMFeature(
                 osmIdentifier: way.id,
                 kind: kind,
                 coordinates: coords,
                 isClosed: isClosed,
                 tags: way.tags ?? [:]
-            )
+            ))
         }
+
+        // Relation (multipolygon) features: many fairways/greens are mapped as
+        // multipolygons rather than simple ways. The builder used to ignore these,
+        // so they went missing. Stitch each relation's `outer` members into a ring
+        // and emit it as a closed feature. Inner rings (holes cut out of the area,
+        // e.g. a bunker) are not subtracted; the overlap is hidden by the bunker
+        // overlay drawn on top.
+        for relation in relationsByID.values {
+            guard let golfTag = relation.tags?["golf"], golfTag != "hole", golfTag != "golf_course" else { continue }
+            let kind = OSMFeature.Kind(rawValue: golfTag) ?? .unknown
+            let outerSegments = relation.members
+                .filter { $0.role == "outer" }
+                .compactMap { member -> [Coordinate]? in
+                    if let geometry = member.geometry, !geometry.isEmpty { return geometry }
+                    return waysByID[member.ref].map { coordinates(for: $0, nodesByID: nodesByID) }
+                }
+            let ring = stitchRing(from: outerSegments)
+            guard ring.count >= 3 else { continue }
+            result.append(OSMFeature(
+                osmIdentifier: relation.id,
+                kind: kind,
+                coordinates: ring,
+                isClosed: true,
+                tags: relation.tags ?? [:]
+            ))
+        }
+
+        return result
     }
 
     /// Collects `natural=tree` node positions, keeping only those that fall inside
