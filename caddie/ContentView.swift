@@ -314,6 +314,13 @@ struct ContentView: View {
         }
     }
 
+    func deleteRecent(_ recent: RecentCourse) {
+        if case .recent(let course) = selection, course.identifier == recent.identifier {
+            selection = nil
+        }
+        modelContext.delete(recent)
+    }
+
     func performSearch(query: String) async {
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = query
@@ -360,6 +367,11 @@ struct ContentView: View {
                     ForEach(recents) { recent in
                         courseRow(course: recent.asGolfCourse, subtitle: nil)
                             .tag(SidebarSelection.recent(recent.asGolfCourse))
+                            .contextMenu {
+                                Button("Remove from Recents", systemImage: "trash", role: .destructive) {
+                                    deleteRecent(recent)
+                                }
+                            }
                     }
                 }
             }

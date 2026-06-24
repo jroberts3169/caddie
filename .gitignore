@@ -1,3 +1,5 @@
 *.xcworkspace
 *.xcodeproj
 *.xcuserstate
+build
+.derived
