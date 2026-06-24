@@ -1,0 +1,127 @@
+# Caddie
+
+A native macOS app for finding golf courses and viewing them on a realistic 3D
+satellite map. Search for any course, star your favorites, and Caddie keeps
+track of the ones you've recently viewed — while fetching detailed course
+geometry (boundaries, holes, greens, bunkers, fairways) from OpenStreetMap in
+the background.
+
+## Table of Contents
+
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Requirements](#requirements)
+- [Getting Started](#getting-started)
+- [Architecture](#architecture)
+  - [Data Models](#data-models)
+  - [OpenStreetMap Integration](#openstreetmap-integration)
+- [Project Structure](#project-structure)
+- [Documentation](#documentation)
+- [Roadmap](#roadmap)
+
+## Features
+
+- **Course search** — find golf courses anywhere using Apple's `MKLocalSearch`,
+  filtered to golf points of interest.
+- **Realistic satellite map** — selected courses are framed on a 3D imagery map
+  with elevation.
+- **Favorites** — star courses to keep them at the top of the sidebar.
+- **Recents** — the last 10 courses you viewed are remembered automatically.
+- **OpenStreetMap enrichment** — course boundaries, holes, and features (greens,
+  fairways, tees, bunkers, hazards, cart paths) are fetched from the Overpass
+  API and cached locally for offline reuse.
+
+## Screenshots
+
+> _Add screenshots of the Course Sidebar and Map Detail Pane here._
+
+## Requirements
+
+- macOS 15 (Sequoia) or later
+- Xcode 16 or later
+- Swift 6
+
+## Getting Started
+
+1. Clone the repository.
+2. Open `caddie.xcodeproj` in Xcode.
+3. Select the **caddie** scheme and a **My Mac** run destination.
+4. Build and run (`⌘R`).
+
+No API keys or accounts are required. The OpenStreetMap data comes from the
+public [Overpass API](https://overpass-api.de/), which Caddie queries politely
+with built-in throttling and back-off.
+
+### Debug logging
+
+OpenStreetMap fetch logging is gated behind the `OSM_DEBUG` compilation
+condition. Add `OSM_DEBUG` to the scheme's *Swift Compiler – Custom Flags →
+Active Compilation Conditions* to print Overpass queries and responses to the
+console.
+
+## Architecture
+
+Caddie is a SwiftUI app backed by SwiftData for persistence. The entire UI is a
+`NavigationSplitView` with a searchable **Course Sidebar** and a **Map Detail
+Pane** (see [docs/ui-glossary.md](docs/ui-glossary.md) for the full UI naming
+contract).
+
+### Data Models
+
+All persistence uses [SwiftData](https://developer.apple.com/documentation/swiftdata)
+`@Model` types defined in [caddie/ContentView.swift](caddie/ContentView.swift):
+
+| Model | Purpose |
+| --- | --- |
+| `RecentCourse` | The 10 most recently viewed courses |
+| `FavoriteCourse` | User-starred courses |
+| `OSMCourseData` | Cached OpenStreetMap geometry with a fetch status and timestamp |
+
+`GolfCourse` is the lightweight, `Codable` value type used throughout the UI and
+search layer.
+
+### OpenStreetMap Integration
+
+When a course is selected, Caddie fetches detailed geometry from the Overpass
+API:
+
+- [OSMFetcher.swift](caddie/OSMFetcher.swift) — an `actor` that builds Overpass
+  QL queries, posts them, handles rate-limiting (HTTP 429/503) with exponential
+  back-off, and deduplicates in-flight requests.
+- [OSMCourse.swift](caddie/OSMCourse.swift) — the domain model and the
+  `OSMCourseBuilder` that walks an Overpass response, resolves node references
+  into coordinate arrays, and produces a structured `OSMCourse` (boundary,
+  holes, and typed features).
+
+Cached results are stored as `OSMCourseData` with a 30-day TTL for successful
+fetches and a 1-hour TTL for errors, so reopening a course is instant and
+network-free.
+
+## Project Structure
+
+```
+caddie/
+  caddieApp.swift     App entry point; sets up the SwiftData model container
+  ContentView.swift   UI, SwiftData models, search, and selection handling
+  OSMCourse.swift     OpenStreetMap domain model + Overpass response parsing
+  OSMFetcher.swift    Overpass API client (actor) with throttling and caching
+  Assets.xcassets     App icon and accent color
+docs/
+  ui-glossary.md      Canonical names for every visible UI element
+```
+
+## Documentation
+
+Project documentation lives in the [docs/](docs) directory:
+
+- [UI/UX Glossary](docs/ui-glossary.md) — canonical names for every visible
+  element in the app.
+
+## Roadmap
+
+- Render fetched OpenStreetMap geometry (boundaries, holes, greens, bunkers,
+  fairways) as overlays on the **Map Surface** — currently only a single course
+  marker is drawn.
+- Surface search and fetch errors in the UI instead of failing silently.
+- Add loading indicators for search results and map data.
+- Add an empty-state placeholder to the **Course Sidebar**.
