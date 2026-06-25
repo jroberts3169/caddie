@@ -198,20 +198,46 @@ actor OSMFetcher {
         )
     }
 
-    /// Removes generic suffixes so a search hit like "Pebble Beach Golf Links"
-    /// still matches an OSM record named "Pebble Beach".
+    /// Strips qualifier suffixes from an Apple Maps course name so the remainder
+    /// matches the (often shorter) name in OSM.
+    ///
+    /// The two-step approach handles the most common mismatches:
+    ///  - Parenthetical course qualifiers: "Torrey Pines (South)" → "Torrey Pines"
+    ///  - Dash-separated qualifiers: "TPC Sawgrass - Stadium" → "TPC Sawgrass"
+    ///  - Trailing golf-category words: "Pebble Beach Golf Links" → "Pebble Beach"
+    ///
+    /// Falls back to the original name if every word would be stripped away, so the
+    /// caller never sends an empty regex pattern (which matches ALL named elements).
     private func simplifyName(_ name: String) -> String {
-        let strippable = ["golf course", "golf club", "golf links", "country club", "golf"]
         var result = name
+
+        // Remove parenthetical qualifiers, e.g. "(South)", "(No. 1)", "(Championship)"
+        if let regex = try? NSRegularExpression(pattern: #"\s*\([^)]*\)"#) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
+        }
+
+        // Remove dash-separated suffixes, e.g. " - Stadium Course", " – Links"
+        if let regex = try? NSRegularExpression(pattern: #"\s*[-–—]\s*\S.*$"#) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
+        }
+
+        let strippable = ["golf course", "golf club", "golf links", "country club", "golf"]
         for term in strippable {
             if let range = result.range(of: term, options: .caseInsensitive) {
                 result.removeSubrange(range)
             }
         }
+
         let collapsed = result
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
-        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Guard against a fully-stripped name producing an empty regex that would
+        // match every named element in the bounding box.
+        return collapsed.isEmpty ? name : collapsed
     }
 
     private func escapeForOverpassRegex(_ input: String) -> String {

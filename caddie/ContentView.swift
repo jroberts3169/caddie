@@ -171,6 +171,11 @@ struct ContentView: View {
     /// (not a flag) keeps the spinner visible when a hover prefetch and the click
     /// that follows overlap — the dedup'd second call must not clear it early.
     @State private var loadingCounts: [String: Int] = [:]
+    /// Shared in-flight fetch tasks keyed by course id. A hover prefetch and the
+    /// click that follows JOIN the same task and both apply its result, instead of
+    /// the second caller racing the first (and going blank if the first is
+    /// cancelled when the pointer leaves the row on selection).
+    @State private var inFlightFetches: [String: Task<OSMCourse?, Error>] = [:]
     
     var body: some View {
         NavigationSplitView {
@@ -186,12 +191,14 @@ struct ContentView: View {
                 ForEach(courseFeatures, id: \.osmIdentifier) { feature in
                     featureOverlay(feature)
                 }
-                ForEach(courseHoles, id: \.osmIdentifier) { hole in
-                    holeOverlay(hole)
-                }
                 ForEach(Array(courseTrees.enumerated()), id: \.offset) { _, tree in
                     MapCircle(center: tree, radius: 4)
                         .foregroundStyle(Color(.courseTree).opacity(0.85))
+                }
+                // Drawn last so the dashed hole centerlines sit on top of the
+                // fairway/green fills rather than being composited under them.
+                ForEach(courseHoles, id: \.osmIdentifier) { hole in
+                    holeOverlay(hole)
                 }
                 if let displayedCourse {
                     Marker(displayedCourse.name, coordinate: displayedCourse.coordinate)
@@ -236,7 +243,9 @@ struct ContentView: View {
     }
 
     /// Map overlay for a single OSM feature: filled polygon for closed areas
-    /// (greens, bunkers, water…), stroked line for open paths.
+    /// (greens, bunkers, water…), stroked line for open paths. Pinned to the
+    /// `.aboveRoads` level so the hole centerlines (drawn at `.aboveLabels`) stay
+    /// on top of these fills.
     @MapContentBuilder
     func featureOverlay(_ feature: OSMFeature) -> some MapContent {
         let coords = feature.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
@@ -245,9 +254,11 @@ struct ContentView: View {
             MapPolygon(coordinates: coords)
                 .foregroundStyle(color.opacity(0.55))
                 .stroke(color, lineWidth: 1)
+                .mapOverlayLevel(level: .aboveRoads)
         } else if coords.count >= 2 {
             MapPolyline(coordinates: coords)
                 .stroke(color, lineWidth: 2)
+                .mapOverlayLevel(level: .aboveRoads)
         }
     }
 
@@ -259,6 +270,7 @@ struct ContentView: View {
         if coords.count >= 2 {
             MapPolyline(coordinates: coords)
                 .stroke(Color(.courseHole), style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                .mapOverlayLevel(level: .aboveLabels)
         }
         if let tee = coords.first {
             Marker(holeMarkerTitle(hole), coordinate: tee)
@@ -363,10 +375,26 @@ struct ContentView: View {
         let id = course.identifier
         osmLog("ensureOSMData start id=\(id) name=\(course.name)")
 
+        // If a fetch for this course is already running (e.g. a hover prefetch),
+        // join it rather than starting a second request. The owner task runs to
+        // completion independently of who started it, so a cancelled hover can't
+        // leave the click with no data — both apply the shared result.
+        if let inflight = inFlightFetches[id] {
+            osmLog("joining in-flight fetch id=\(id)")
+            let result = try? await inflight.value
+            applyOutline(from: result ?? osmCache[id], for: course)
+            applyFeatures(from: result ?? osmCache[id], for: course)
+            return
+        }
+
         let descriptor = FetchDescriptor<OSMCourseData>(predicate: #Predicate { $0.courseIdentifier == id })
         let existing = try? modelContext.fetch(descriptor).first
 
         let successTTL: TimeInterval = 60 * 60 * 24 * 30
+        // notFound is often caused by a transient name-mismatch (e.g. Apple Maps
+        // names with "(South)" suffixes). Retry after a day so a bad cache entry
+        // doesn't permanently suppress a course that is actually in OSM.
+        let notFoundTTL: TimeInterval = 60 * 60 * 24
         // Short error window: a transient failure (e.g. a rate-limited mirror)
         // should be retried soon, not frozen out for an hour.
         let errorTTL: TimeInterval = 60 * 2
@@ -378,7 +406,7 @@ struct ContentView: View {
             case "ok" where age < successTTL:
                 osmLog("cache hit (ok), skipping fetch")
                 return
-            case "notFound" where age < successTTL:
+            case "notFound" where age < notFoundTTL:
                 osmLog("cache hit (notFound), skipping fetch")
                 return
             case "error" where age < errorTTL:
@@ -395,8 +423,26 @@ struct ContentView: View {
             osmLog("no cache row, fetching")
         }
 
+        // Start the owner task as an unstructured Task so it survives cancellation
+        // of whoever kicked it off (a hover prefetch is cancelled when the pointer
+        // leaves the row). It clears its own in-flight entry on completion.
+        let task = Task<OSMCourse?, Error> {
+            defer { inFlightFetches[id] = nil }
+            return await performOSMFetch(for: course, existing: existing)
+        }
+        inFlightFetches[id] = task
+        _ = try? await task.value
+    }
+
+    /// Runs the two-stage network fetch, applying each stage to the map and
+    /// persisting the result. Returns the best course produced (complete, or the
+    /// boundary-only fallback) so a joining caller can apply it directly.
+    @discardableResult
+    private func performOSMFetch(for course: GolfCourse, existing: OSMCourseData?) async -> OSMCourse? {
+        let id = course.identifier
         // Track the boundary so a Stage B failure can still persist Stage A's result.
         var boundaryCourse: OSMCourse?
+        var bestCourse: OSMCourse?
         do {
             osmLog("calling fetcher.fetch")
             beginLoading(id)
@@ -411,11 +457,13 @@ struct ContentView: View {
                 case .boundary(let osmCourse):
                     osmLog("stage boundary id=\(id) points=\(osmCourse.boundary.count)")
                     boundaryCourse = osmCourse
+                    bestCourse = osmCourse
                     applyOutline(from: osmCourse, for: course)
                 case .complete(let osmCourse):
                     let encoded = try JSONEncoder().encode(osmCourse)
                     logOSMCourse(osmCourse, encoded: encoded, identifier: id)
                     osmCache[id] = osmCourse
+                    bestCourse = osmCourse
                     applyOutline(from: osmCourse, for: course)
                     applyFeatures(from: osmCourse, for: course)
                     upsertOSMData(courseIdentifier: id, encoded: encoded, status: "ok", existing: existing)
@@ -440,6 +488,7 @@ struct ContentView: View {
                 upsertOSMData(courseIdentifier: id, encoded: nil, status: "error", existing: existing)
             }
         }
+        return bestCourse
     }
 
     private func logOSMCourse(_ osmCourse: OSMCourse, encoded: Data, identifier: String) {
