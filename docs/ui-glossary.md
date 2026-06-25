@@ -17,14 +17,17 @@ lives in [caddie/ContentView.swift](../caddie/ContentView.swift), hosted by
   - [2.2 Sidebar Sections](#22-sidebar-sections)
   - [2.3 Course Row](#23-course-row)
 - [3. Map Detail Pane](#3-map-detail-pane)
-- [4. Behaviors](#4-behaviors)
-  - [4.1 Selection](#41-selection)
-  - [4.2 Favoriting](#42-favoriting)
-  - [4.3 Search](#43-search)
-  - [4.4 Recents Tracking](#44-recents-tracking)
-- [5. States](#5-states)
-- [6. Where Do I Click To…](#6-where-do-i-click-to)
-- [7. Known Issues to Address](#7-known-issues-to-address)
+  - [3.1 Map Overlay Layers](#31-map-overlay-layers)
+- [4. Overlay Settings Window](#4-overlay-settings-window)
+- [5. Behaviors](#5-behaviors)
+  - [5.1 Selection](#51-selection)
+  - [5.2 Favoriting](#52-favoriting)
+  - [5.3 Search](#53-search)
+  - [5.4 Recents Tracking](#54-recents-tracking)
+  - [5.5 Overlay Styling](#55-overlay-styling)
+- [6. States](#6-states)
+- [7. Where Do I Click To…](#7-where-do-i-click-to)
+- [8. Known Issues to Address](#8-known-issues-to-address)
 
 ---
 
@@ -92,6 +95,11 @@ a sidebar and a map detail pane.
 | --- | --- | --- | --- |
 | Satellite map surface | **Map Surface** | Always | Realistic imagery map |
 | Pin on the selected course | **Course Marker** | Only when a course is displayed | Marks the selected course coordinate |
+| Drawn OSM geometry | **Map Overlay Layers** | Per layer, when fetched and the layer is enabled | Boundary, holes, trees, and course-feature fills (see [§3.1](#31-map-overlay-layers)) |
+
+> The color and visibility of every **Map Overlay Layer** are user-configurable in
+> the **Overlay Settings Window** (see [§4](#4-overlay-settings-window)), opened
+> from **caddie ▸ Settings…** (⌘,).
 
 ---
 
@@ -155,16 +163,91 @@ Source: the `detail:` closure in [ContentView.swift](../caddie/ContentView.swift
 | Map view | **Map Surface** | [ContentView.swift](../caddie/ContentView.swift#L163-L168) | `Map(position:)` with `.mapStyle(.imagery(elevation: .realistic))` — 3D satellite imagery |
 | Selected-course pin | **Course Marker** | [ContentView.swift](../caddie/ContentView.swift#L164-L166) | A `Marker` labeled with the course name at the course coordinate; only rendered when `displayedCourse` is non-nil |
 
-> The **Map Surface** has no overlays, controls, or annotations beyond the
-> single **Course Marker**. OSM course geometry (boundary, holes, features) is
-> fetched and cached ([ContentView.swift](../caddie/ContentView.swift#L193-L283))
-> but is **not yet drawn** on the **Map Surface**.
+> The **Map Surface** also draws **Map Overlay Layers** (boundary, holes, trees,
+> and per-feature fills) for the selected course's OSM geometry. Each layer's
+> color and on/off state come from the **Overlay Settings Window** ([§4](#4-overlay-settings-window)).
+
+### 3.1 Map Overlay Layers
+
+Each layer is drawn only when its data is present **and** its **Layer Visibility
+Switch** is on. Colors default to the values below (the asset-catalog course
+colors, white for the boundary) until overridden in the **Overlay Settings
+Window**.
+
+| Element | Canonical name | Source | Default color | Settings layer |
+| --- | --- | --- | --- | --- |
+| Course outline polygon stroke | **Course Boundary Overlay** | [ContentView.swift](../caddie/ContentView.swift#L187-L191) | White | Course Boundary |
+| Dashed tee→green centerline | **Hole Centerline** | [ContentView.swift](../caddie/ContentView.swift#L276-L289) | `CourseHole` | Holes |
+| Numbered marker at each tee | **Hole Tee Marker** | [ContentView.swift](../caddie/ContentView.swift#L285-L288) | `CourseHole` | Holes |
+| Small circle per tree | **Tree Dot** | [ContentView.swift](../caddie/ContentView.swift#L196-L201) | `CourseTree` | Trees |
+| Filled/stroked feature geometry | **Feature Overlay** | [ContentView.swift](../caddie/ContentView.swift#L254-L271) | Per kind (below) | Per kind (below) |
+
+The **Feature Overlay** is one shape per OSM feature, colored by kind. Closed
+areas render as a translucent filled polygon; open paths as a stroked polyline.
+
+| Feature kind | Canonical name | Default color | Settings layer |
+| --- | --- | --- | --- |
+| Green | **Green Overlay** | `CourseGreen` | Greens |
+| Fairway | **Fairway Overlay** | `CourseFairway` | Fairways |
+| Tee | **Tee Overlay** | `CourseTee` | Tees |
+| Bunker | **Bunker Overlay** | `CourseBunker` | Bunkers |
+| Rough | **Rough Overlay** | `CourseRough` | Rough |
+| Water hazard | **Water Hazard Overlay** | `CourseWater` | Water Hazards |
+| Cart path / path | **Cart Path Overlay** | `CoursePath` | Cart Paths |
+| Driving range | **Driving Range Overlay** | `CourseDrivingRange` | Driving Range |
+| Unknown | **Other Feature Overlay** | `CourseUnknown` | Other Features |
+
+> A **Settings layer** maps one-to-one to a row in the **Overlay Settings
+> Window**. The nine **Feature Overlay** kinds collapse cart paths and generic
+> paths onto a single **Cart Paths** layer.
 
 ---
 
-## 4. Behaviors
+## 4. Overlay Settings Window
 
-### 4.1 Selection
+The **Overlay Settings Window** is the app's `Settings` scene, opened from
+**caddie ▸ Settings…** (⌘,). It is the single place to recolor and show/hide the
+**Map Overlay Layers**. Source: [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift),
+backed by the observable [OverlaySettings.swift](../caddie/OverlaySettings.swift)
+store (persisted to `UserDefaults`).
+
+```
+┌──────────── Overlay Settings Window ────────────┐
+│ Course Structure                                │  ← Course Structure Section
+│   ⬛  Course Boundary               ●━━━○        │  ← Overlay Layer Row
+│   ⬛  Holes                         ●━━━○        │
+│   ⬛  Trees                         ●━━━○        │
+│ Boundary outline, hole centerlines, and trees.  │
+│                                                 │
+│ Course Features                                 │  ← Course Features Section
+│   ⬛  Greens                        ●━━━○        │
+│   ⬛  Fairways                      ●━━━○        │
+│   ⬛  …                             ●━━━○        │
+│                                                 │
+│            [ Reset to Defaults ]                │  ← Reset to Defaults Button
+└─────────────────────────────────────────────────┘
+   ⬛ = Layer Color Well        ●━━━○ = Layer Visibility Switch
+```
+
+| Element | Canonical name | Source | Notes |
+| --- | --- | --- | --- |
+| Whole settings window | **Overlay Settings Window** | [caddieApp.swift](../caddie/caddieApp.swift#L40-L43), [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | A grouped `Form` in the `Settings` scene; fixed 440×560 |
+| "Course Structure" group | **Course Structure Section** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Boundary, Holes, Trees rows |
+| "Course Features" group | **Course Features Section** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | The nine feature-kind rows |
+| One layer's row | **Overlay Layer Row** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Color well + name + visibility switch |
+| Leading color picker well | **Layer Color Well** | `ColorPicker`, [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Opens the system color panel; supports opacity |
+| Trailing on/off switch | **Layer Visibility Switch** | `Toggle(.switch)`, [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Shows/hides the matching **Map Overlay Layer** |
+| Reset button | **Reset to Defaults Button** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Clears every override, reverting all layers to their default color and visible |
+
+> The **Overlay Settings Window** is the only window besides the **Courses
+> Window**. Edits apply to the **Map Surface** immediately and persist across
+> launches.
+
+---
+
+## 5. Behaviors
+
+### 5.1 Selection
 
 - Selecting a **Course Row** sets `selection` and triggers the `.onChange(of:
   selection)` handler ([ContentView.swift](../caddie/ContentView.swift#L183-L190)).
@@ -175,29 +258,41 @@ Source: the `detail:` closure in [ContentView.swift](../caddie/ContentView.swift
   or `.result` ([ContentView.swift](../caddie/ContentView.swift#L143-L153)) — so
   the same course can be selected from different sections.
 
-### 4.2 Favoriting
+### 5.2 Favoriting
 
 - Clicking the **Favorite Star Button** calls `toggleFavorite`
   ([ContentView.swift](../caddie/ContentView.swift#L292-L301)): inserts a
   `FavoriteCourse` if absent, deletes it if present.
 - Favoriting does not select the row or move the **Map Surface** camera.
 
-### 4.3 Search
+### 5.3 Search
 
 - Typing in the **Search Field** runs `performSearch`
   ([ContentView.swift](../caddie/ContentView.swift#L303-L321)) via `MKLocalSearch`
   filtered to `.golf` points of interest.
 - Clearing the **Search Field** empties the **Results Section** immediately.
 
-### 4.4 Recents Tracking
+### 5.4 Recents Tracking
 
 - `recordRecent` ([ContentView.swift](../caddie/ContentView.swift#L256-L272))
   inserts the course and trims the **Recents Section** to the 10 most recent
   entries.
 
+### 5.5 Overlay Styling
+
+- Each **Overlay Layer Row** in the **Overlay Settings Window** drives one
+  **Map Overlay Layer**. Adjusting a **Layer Color Well** recolors that layer on
+  the **Map Surface** live; flipping a **Layer Visibility Switch** shows or hides
+  it.
+- Settings persist to `UserDefaults` (color as `#RRGGBBAA` sRGB hex) and survive
+  relaunch. Unset layers fall back to their default color and visible, so a fresh
+  install renders identically to before the window existed.
+- A hidden layer is still fetched and cached — visibility only gates drawing.
+- The **Reset to Defaults Button** clears every override at once.
+
 ---
 
-## 5. States
+## 6. States
 
 | Surface | Empty state | Loading state | Error state |
 | --- | --- | --- | --- |
@@ -206,7 +301,7 @@ Source: the `detail:` closure in [ContentView.swift](../caddie/ContentView.swift
 
 ---
 
-## 6. Where Do I Click To…
+## 7. Where Do I Click To…
 
 | Goal | Click target |
 | --- | --- |
@@ -214,14 +309,12 @@ Source: the `detail:` closure in [ContentView.swift](../caddie/ContentView.swift
 | View a course on the map | Any **Course Row** |
 | Mark/unmark a favorite | **Favorite Star Button** on that row |
 | Return to a course you viewed before | A **Course Row** in the **Recents Section** |
+| Recolor or hide a map overlay | The matching **Overlay Layer Row** in the **Overlay Settings Window** (⌘,) |
 
 ---
 
-## 7. Known Issues to Address
+## 8. Known Issues to Address
 
-- OSM geometry (boundary, holes, greens, bunkers, fairways) is fetched and
-  cached but never rendered on the **Map Surface** — only the single
-  **Course Marker** appears.
 - Search failures and OSM fetch errors have no user-visible **error state**;
   they fail silently.
 - There is no loading indicator anywhere; the **Results Section** and

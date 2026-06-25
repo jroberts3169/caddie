@@ -10,6 +10,8 @@ import SwiftUI
 
 @main
 struct caddieApp: App {
+    @State private var overlaySettings = OverlaySettings()
+
     let modelContainer: ModelContainer = {
         do {
             return try ModelContainer(for: RecentCourse.self, FavoriteCourse.self, OSMCourseData.self)
@@ -21,6 +23,7 @@ struct caddieApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(overlaySettings)
         }
         .modelContainer(modelContainer)
         #if DEBUG
@@ -33,6 +36,11 @@ struct caddieApp: App {
             }
         }
         #endif
+
+        Settings {
+            OverlaySettingsView()
+                .environment(overlaySettings)
+        }
     }
 
     #if DEBUG
