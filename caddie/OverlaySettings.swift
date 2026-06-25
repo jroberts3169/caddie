@@ -72,6 +72,32 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Painter order for the feature overlays that share the `.aboveRoads` map
+    /// level. Lower values are drawn first (further back); higher values
+    /// composite on top. Tuned so the visible stack reads, top to bottom:
+    /// hole line ▸ greens ▸ fairways ▸ rough — the broad turf areas sit at the
+    /// back, with the smaller detail features (tees, bunkers, water, cart paths)
+    /// layered on top of the turf they sit within. The hole centerlines render
+    /// at `.aboveLabels`, so they always stay above every feature here.
+    var drawOrder: Int {
+        switch self {
+        case .rough: return 0
+        case .drivingRange: return 1
+        case .fairway: return 2
+        case .green: return 3
+        case .tee: return 4
+        case .bunker: return 5
+        case .water: return 6
+        case .path: return 7
+        case .unknown: return 8
+        // Structure layers render in their own passes, not the feature loop,
+        // so these only matter if the value is ever read for them.
+        case .boundary: return -1
+        case .trees: return 98
+        case .holes: return 99
+        }
+    }
+
     /// The overlay layer a given OSM feature kind is drawn on.
     static func forFeature(_ kind: OSMFeature.Kind) -> OverlayLayer {
         switch kind {

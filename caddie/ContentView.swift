@@ -362,7 +362,13 @@ struct ContentView: View {
     /// longer the displayed one.
     func applyFeatures(from osmCourse: OSMCourse?, for course: GolfCourse) {
         guard displayedCourse?.identifier == course.identifier, let osmCourse else { return }
-        courseFeatures = osmCourse.features
+        // OSM features arrive in arbitrary (dictionary) order, so the rough could
+        // composite over greens/fairways. Sort into a stable painter order so the
+        // turf stacks back-to-front (rough ▸ fairway ▸ green ▸ detail features);
+        // within the `.aboveRoads` level, declaration order is the z-order.
+        courseFeatures = osmCourse.features.sorted {
+            OverlayLayer.forFeature($0.kind).drawOrder < OverlayLayer.forFeature($1.kind).drawOrder
+        }
         courseHoles = osmCourse.holes
         courseTrees = osmCourse.trees.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
     }
