@@ -152,6 +152,7 @@ enum SidebarSelection: Hashable {
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.osmFetcher) private var osmFetcher
+    @Environment(OverlaySettings.self) private var overlay
     @Query(sort: \RecentCourse.lastVisited, order: .reverse) private var recents: [RecentCourse]
     @Query(sort: \FavoriteCourse.dateFavorited, order: .reverse) private var favorites: [FavoriteCourse]
     @State private var searchText: String = ""
@@ -183,22 +184,26 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             Map(position: $cameraPosition) {
-                if courseOutline.count >= 3 {
+                if overlay.isVisible(.boundary), courseOutline.count >= 3 {
                     MapPolygon(coordinates: courseOutline)
                         .foregroundStyle(.gray.opacity(0.0))
-                        .stroke(.white, lineWidth: 3)
+                        .stroke(overlay.color(for: .boundary), lineWidth: 3)
                 }
                 ForEach(courseFeatures, id: \.osmIdentifier) { feature in
                     featureOverlay(feature)
                 }
-                ForEach(Array(courseTrees.enumerated()), id: \.offset) { _, tree in
-                    MapCircle(center: tree, radius: 4)
-                        .foregroundStyle(Color(.courseTree).opacity(0.85))
+                if overlay.isVisible(.trees) {
+                    ForEach(Array(courseTrees.enumerated()), id: \.offset) { _, tree in
+                        MapCircle(center: tree, radius: 4)
+                            .foregroundStyle(overlay.color(for: .trees).opacity(0.85))
+                    }
                 }
                 // Drawn last so the dashed hole centerlines sit on top of the
                 // fairway/green fills rather than being composited under them.
-                ForEach(courseHoles, id: \.osmIdentifier) { hole in
-                    holeOverlay(hole)
+                if overlay.isVisible(.holes) {
+                    ForEach(courseHoles, id: \.osmIdentifier) { hole in
+                        holeOverlay(hole)
+                    }
                 }
                 if let displayedCourse {
                     Marker(displayedCourse.name, coordinate: displayedCourse.coordinate)
@@ -248,17 +253,20 @@ struct ContentView: View {
     /// on top of these fills.
     @MapContentBuilder
     func featureOverlay(_ feature: OSMFeature) -> some MapContent {
-        let coords = feature.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-        let color = featureColor(for: feature.kind)
-        if feature.isClosed, coords.count >= 3 {
-            MapPolygon(coordinates: coords)
-                .foregroundStyle(color.opacity(0.55))
-                .stroke(color, lineWidth: 1)
-                .mapOverlayLevel(level: .aboveRoads)
-        } else if coords.count >= 2 {
-            MapPolyline(coordinates: coords)
-                .stroke(color, lineWidth: 2)
-                .mapOverlayLevel(level: .aboveRoads)
+        let layer = OverlayLayer.forFeature(feature.kind)
+        if overlay.isVisible(layer) {
+            let coords = feature.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+            let color = overlay.color(for: layer)
+            if feature.isClosed, coords.count >= 3 {
+                MapPolygon(coordinates: coords)
+                    .foregroundStyle(color.opacity(0.55))
+                    .stroke(color, lineWidth: 1)
+                    .mapOverlayLevel(level: .aboveRoads)
+            } else if coords.count >= 2 {
+                MapPolyline(coordinates: coords)
+                    .stroke(color, lineWidth: 2)
+                    .mapOverlayLevel(level: .aboveRoads)
+            }
         }
     }
 
@@ -266,15 +274,16 @@ struct ContentView: View {
     /// marker at the tee carrying par/length detail.
     @MapContentBuilder
     func holeOverlay(_ hole: OSMHole) -> some MapContent {
+        let holeColor = overlay.color(for: .holes)
         let coords = hole.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
         if coords.count >= 2 {
             MapPolyline(coordinates: coords)
-                .stroke(Color(.courseHole), style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                .stroke(holeColor, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
                 .mapOverlayLevel(level: .aboveLabels)
         }
         if let tee = coords.first {
             Marker(holeMarkerTitle(hole), coordinate: tee)
-                .tint(Color(.courseHole))
+                .tint(holeColor)
         }
     }
 
@@ -289,19 +298,6 @@ struct ContentView: View {
         return parts.isEmpty ? "Hole" : parts.joined(separator: " · ")
     }
 
-    private func featureColor(for kind: OSMFeature.Kind) -> Color {
-        switch kind {
-        case .green: return Color(.courseGreen)
-        case .fairway: return Color(.courseFairway)
-        case .tee: return Color(.courseTee)
-        case .bunker: return Color(.courseBunker)
-        case .rough: return Color(.courseRough)
-        case .waterHazard: return Color(.courseWater)
-        case .cartpath, .path: return Color(.coursePath)
-        case .drivingRange: return Color(.courseDrivingRange)
-        case .unknown: return Color(.courseUnknown)
-        }
-    }
     /// Subtle, non-blocking progress chip shown while the displayed course's data is
     /// loading from the network. Rendered unconditionally and driven by opacity so
     /// the overlay subtree is never inserted/removed near the Map view.
@@ -686,5 +682,6 @@ extension EnvironmentValues {
 #Preview {
     ContentView()
         .modelContainer(for: [RecentCourse.self, FavoriteCourse.self, OSMCourseData.self], inMemory: true)
+        .environment(OverlaySettings())
 }
 

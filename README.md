@@ -33,6 +33,8 @@ the background.
 - **OpenStreetMap enrichment** — course boundaries, holes, and features (greens,
   fairways, tees, bunkers, hazards, cart paths) are fetched from the Overpass
   API and cached locally for offline reuse.
+- **Customizable overlays** — an **Overlay Settings** window (⌘,) lets you recolor
+  every map overlay layer and toggle each one's visibility.
 
 ## Screenshots
 
@@ -99,11 +101,13 @@ network-free.
 
 ```
 caddie/
-  caddieApp.swift     App entry point; sets up the SwiftData model container
-  ContentView.swift   UI, SwiftData models, search, and selection handling
-  OSMCourse.swift     OpenStreetMap domain model + Overpass response parsing
-  OSMFetcher.swift    Overpass API client (actor) with throttling and caching
-  Assets.xcassets     App icon and accent color
+  caddieApp.swift          App entry point; SwiftData container + Settings scene
+  ContentView.swift        UI, SwiftData models, search, and selection handling
+  OverlaySettings.swift    Observable per-overlay color/visibility store
+  OverlaySettingsView.swift Overlay Settings window (⌘,)
+  OSMCourse.swift          OpenStreetMap domain model + Overpass response parsing
+  OSMFetcher.swift         Overpass API client (actor) with throttling and caching
+  Assets.xcassets          App icon, accent color, and per-overlay course colors
 docs/
   ui-glossary.md      Canonical names for every visible UI element
 ```
@@ -117,9 +121,6 @@ Project documentation lives in the [docs/](docs) directory:
 
 ## Roadmap
 
-- Render fetched OpenStreetMap geometry (boundaries, holes, greens, bunkers,
-  fairways) as overlays on the **Map Surface** — currently only a single course
-  marker is drawn.
 - Surface search and fetch errors in the UI instead of failing silently.
 - Add loading indicators for search results and map data.
 - Add an empty-state placeholder to the **Course Sidebar**.
