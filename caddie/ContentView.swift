@@ -130,11 +130,6 @@ final class OSMCourseData {
         self.fetchedAt = fetchedAt
         self.fetchStatus = fetchStatus
     }
-
-    var course: OSMCourse? {
-        guard let encodedCourse else { return nil }
-        return try? JSONDecoder().decode(OSMCourse.self, from: encodedCourse)
-    }
 }
 
 enum SidebarSelection: Hashable {
@@ -159,23 +154,29 @@ struct ContentView: View {
     @State private var searchResults: [GolfCourse] = []
     @State private var selection: SidebarSelection?
     @State private var displayedCourse: GolfCourse?
-    @State private var courseOutline: [CLLocationCoordinate2D] = []
+    @State private var courseOutlines: [[CLLocationCoordinate2D]] = []
     @State private var courseFeatures: [OSMFeature] = []
-    @State private var courseTrees: [CLLocationCoordinate2D] = []
     @State private var courseHoles: [OSMHole] = []
+    /// Sub-courses of the displayed facility (empty for an ordinary single course);
+    /// drives both the sidebar disclosure and the on-map segmented picker.
+    @State private var displayedSubCourses: [OSMSubCourse] = []
+    /// The sub-course currently shown, or `nil` when the displayed course is a single
+    /// course (or, transiently, before its OSM data has loaded).
+    @State private var activeSubCourseID: String?
     @State private var cameraPosition: MapCameraPosition = .automatic
-    @State private var hoverPrefetchTasks: [String: Task<Void, Never>] = [:]
+    /// Cancellable handle for the progressive feature renderer (see `renderChunked`),
+    /// so a new selection can stop a paint that is still in progress.
+    @State private var featureRenderTask: Task<Void, Never>?
     /// In-memory decoded-geometry cache, keyed by course id, so re-selecting a
     /// course in the same session skips the SwiftData fetch + JSON decode.
     @State private var osmCache: [String: OSMCourse] = [:]
     /// Reference-counted set of course ids with an in-flight network fetch. A count
-    /// (not a flag) keeps the spinner visible when a hover prefetch and the click
-    /// that follows overlap — the dedup'd second call must not clear it early.
+    /// (not a flag) keeps the spinner visible when two fetches for the same course
+    /// overlap — the dedup'd second call must not clear it early.
     @State private var loadingCounts: [String: Int] = [:]
-    /// Shared in-flight fetch tasks keyed by course id. A hover prefetch and the
-    /// click that follows JOIN the same task and both apply its result, instead of
-    /// the second caller racing the first (and going blank if the first is
-    /// cancelled when the pointer leaves the row on selection).
+    /// Shared in-flight fetch tasks keyed by course id. Overlapping selections of
+    /// the same course JOIN the same task and both apply its result, instead of the
+    /// second caller racing the first (and going blank if the first is cancelled).
     @State private var inFlightFetches: [String: Task<OSMCourse?, Error>] = [:]
     
     var body: some View {
@@ -184,19 +185,15 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             Map(position: $cameraPosition) {
-                if overlay.isVisible(.boundary), courseOutline.count >= 3 {
-                    MapPolygon(coordinates: courseOutline)
-                        .foregroundStyle(.gray.opacity(0.0))
-                        .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                if overlay.isVisible(.boundary) {
+                    ForEach(courseOutlines.indices, id: \.self) { i in
+                        MapPolygon(coordinates: courseOutlines[i])
+                            .foregroundStyle(.gray.opacity(0.0))
+                            .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                    }
                 }
                 ForEach(courseFeatures, id: \.osmIdentifier) { feature in
                     featureOverlay(feature)
-                }
-                if overlay.isVisible(.trees) {
-                    ForEach(Array(courseTrees.enumerated()), id: \.offset) { _, tree in
-                        MapCircle(center: tree, radius: 4)
-                            .foregroundStyle(overlay.color(for: .trees).opacity(0.85))
-                    }
                 }
                 // Drawn last so the dashed hole centerlines sit on top of the
                 // fairway/green fills rather than being composited under them.
@@ -213,6 +210,9 @@ struct ContentView: View {
             .overlay(alignment: .top) {
                 loadingBanner
             }
+            .overlay(alignment: .bottom) {
+                subCoursePicker
+            }
         }
         .navigationTitle("Caddie")
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
@@ -228,22 +228,39 @@ struct ContentView: View {
         .onChange(of: selection) { _, newValue in
             guard let course = newValue?.course else { return }
             displayedCourse = course
-            courseOutline = []
+            courseOutlines = []
             courseFeatures = []
-            courseTrees = []
             courseHoles = []
+            displayedSubCourses = []
+            activeSubCourseID = nil
+            // Stop any progressive overlay render still painting the previous course.
+            featureRenderTask?.cancel()
             cameraPosition = .region(MKCoordinateRegion(
                 center: course.coordinate,
                 latitudinalMeters: 2000,
                 longitudinalMeters: 2000
             ))
             recordRecent(course)
-            // Draw whatever is already cached immediately, then progressively
-            // refresh from the network (boundary first, features after).
-            let cached = cachedCourse(for: course)
-            applyOutline(from: cached, for: course)
-            applyFeatures(from: cached, for: course)
-            Task { await ensureOSMData(for: course) }
+            // Cancel any in-flight fetch for a course the user has already moved past
+            // so the new selection doesn't have to compete with it for the same
+            // Overpass mirror.
+            for (id, task) in inFlightFetches where id != course.identifier {
+                task.cancel()
+            }
+            // Draw whatever is already cached (decoded off the main thread) and then
+            // progressively refresh from the network (boundary first, features after).
+            Task {
+                let cached = await cachedCourse(for: course)
+                drawCourse(cached, for: course)
+                await ensureOSMData(for: course)
+            }
+        }
+        .onChange(of: activeSubCourseID) {
+            // Switching sub-course (from the sidebar or the on-map picker) re-filters
+            // the boundary, holes and features to the newly active course.
+            guard let course = displayedCourse, let osmCourse = osmCache[course.identifier] else { return }
+            applyOutline(from: osmCourse, for: course)
+            applyFeatures(from: osmCourse, for: course)
         }
     }
 
@@ -317,6 +334,38 @@ struct ContentView: View {
         .allowsHitTesting(false)
     }
 
+    /// Floating segmented control for switching between a facility's sub-courses
+    /// (e.g. Balboa Park's Championship / Executive). Hidden for ordinary single
+    /// courses. Mirrors — and is kept in sync with — the sidebar disclosure.
+    @ViewBuilder
+    private var subCoursePicker: some View {
+        if displayedSubCourses.count > 1 {
+            Picker("Course", selection: $activeSubCourseID) {
+                Text("All").tag(String?.none)
+                ForEach(displayedSubCourses) { sub in
+                    Text(subCourseLabel(sub)).tag(sub.id as String?)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .padding(8)
+            .background(.regularMaterial, in: Capsule())
+            .padding(.bottom, 16)
+        }
+    }
+
+    /// Compact label for a sub-course segment: the name with a trailing
+    /// "Course"/"Golf Course" trimmed so segments stay short ("Championship").
+    private func subCourseLabel(_ sub: OSMSubCourse) -> String {
+        guard let name = sub.name, !name.isEmpty else { return "Course" }
+        let trimmed = name
+            .replacingOccurrences(of: " Golf Course", with: "")
+            .replacingOccurrences(of: " Course", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? name : trimmed
+    }
+
     /// True when the currently displayed course has an in-flight network fetch.
     private var isLoadingDisplayed: Bool {
         guard let id = displayedCourse?.identifier else { return false }
@@ -338,48 +387,161 @@ struct ContentView: View {
     /// Decodes the cached OSM course for the given identifier, if present. Consults
     /// the in-memory cache first to avoid a SwiftData fetch + JSON decode on
     /// re-selection; falls back to the on-disk store and warms the memory cache.
-    func cachedCourse(for course: GolfCourse) -> OSMCourse? {
+    func cachedCourse(for course: GolfCourse) async -> OSMCourse? {
         let id = course.identifier
         if let cached = osmCache[id] {
             return cached
         }
         let descriptor = FetchDescriptor<OSMCourseData>(predicate: #Predicate { $0.courseIdentifier == id })
-        let decoded = (try? modelContext.fetch(descriptor).first)?.course
+        guard let data = (try? modelContext.fetch(descriptor).first)?.encodedCourse else { return nil }
+        // Decode off the main thread. A full course is a large JSON blob and was
+        // previously decoded synchronously inside `.onChange`, stalling the UI
+        // ~280 ms (per Instruments). `OSMCourse` is `nonisolated`/`Sendable`, so it
+        // crosses the detached-task boundary safely.
+        let decoded = await Task.detached(priority: .userInitiated) {
+            try? JSONDecoder().decode(OSMCourse.self, from: data)
+        }.value
         if let decoded {
             osmCache[id] = decoded
         }
         return decoded
     }
 
-    /// Assigns the boundary outline, ignoring stale results for a course that is no
-    /// longer the displayed one.
+    /// Draws a course end-to-end: resolves which sub-course (if any) is active, then
+    /// paints the boundary, holes and features filtered to it. The single entry point
+    /// for the cached, joined-fetch and freshly-fetched draw paths so all three stay
+    /// in sync on the sub-course state.
+    func drawCourse(_ osmCourse: OSMCourse?, for course: GolfCourse) {
+        applySubCourseState(from: osmCourse, for: course)
+        applyOutline(from: osmCourse, for: course)
+        applyFeatures(from: osmCourse, for: course)
+    }
+
+    /// Publishes the facility's sub-courses and defaults the active selection to
+    /// "All" (`nil`) — the whole facility, so untagged features (a driving range,
+    /// the clubhouse area) stay visible and a multi-course park reads as one. Keeps a
+    /// still-valid existing selection so a network refresh doesn't snap the user back
+    /// off a sub-course they switched to from the cached draw.
+    func applySubCourseState(from osmCourse: OSMCourse?, for course: GolfCourse) {
+        guard displayedCourse?.identifier == course.identifier else { return }
+        let subs = osmCourse?.subCourses ?? []
+        displayedSubCourses = subs
+        if let active = activeSubCourseID, subs.contains(where: { $0.id == active }) {
+            return
+        }
+        activeSubCourseID = nil
+    }
+
+    /// The currently active sub-course within `osmCourse`, or `nil` when none is
+    /// selected — an ordinary single course, or a facility shown in full ("All").
+    func activeSubCourse(in osmCourse: OSMCourse) -> OSMSubCourse? {
+        guard let id = activeSubCourseID else { return nil }
+        return osmCourse.subCourses.first { $0.id == id }
+    }
+
+    /// Holes attributed to the active sub-course; all holes when no sub-course is
+    /// active. Attribution is precomputed at build time (`holeIDs`), so render is a
+    /// pure membership filter.
+    func visibleHoles(in osmCourse: OSMCourse) -> [OSMHole] {
+        guard let sub = activeSubCourse(in: osmCourse) else { return osmCourse.holes }
+        let ids = Set(sub.holeIDs)
+        return osmCourse.holes.filter { ids.contains($0.osmIdentifier) }
+    }
+
+    /// Features attributed to the active sub-course; all features when no sub-course
+    /// is active. Attribution is precomputed at build time (`featureIDs`).
+    func visibleFeatures(in osmCourse: OSMCourse) -> [OSMFeature] {
+        guard let sub = activeSubCourse(in: osmCourse) else { return osmCourse.features }
+        let ids = Set(sub.featureIDs)
+        return osmCourse.features.filter { ids.contains($0.osmIdentifier) }
+    }
+
+    /// Assigns the boundary outline(s), ignoring stale results for a course that is
+    /// no longer the displayed one.
+    ///  - Active sub-course → one outline: that sub-course's own boundary.
+    ///  - "All" on a facility → one outline per sub-course, so every course boundary
+    ///    is drawn simultaneously (e.g. both Balboa rings, all 5 Bethpage hulls).
+    ///  - Single course (no sub-courses) → one outline: the whole-course boundary.
     func applyOutline(from osmCourse: OSMCourse?, for course: GolfCourse) {
         guard displayedCourse?.identifier == course.identifier, let osmCourse else { return }
-        courseOutline = osmCourse.boundary.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        func clCoords(_ ring: [Coordinate]) -> [CLLocationCoordinate2D] {
+            ring.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        }
+        if let sub = activeSubCourse(in: osmCourse) {
+            // A specific sub-course is selected: draw only its boundary.
+            courseOutlines = [clCoords(sub.boundary)]
+        } else {
+            // "All" or a single course: draw the facility's primary boundary ring.
+            courseOutlines = [clCoords(osmCourse.boundary)]
+        }
     }
 
     /// Assigns the course features, ignoring stale results for a course that is no
-    /// longer the displayed one.
+    /// longer the displayed one. Features are published progressively (see
+    /// `renderChunked`) so MapKit meshes a bounded batch per runloop turn instead of
+    /// one large synchronous mesh — the latter blocked the main thread ~400 ms in
+    /// VectorKit (per Instruments). Holes are cheap framing geometry, drawn at once.
     func applyFeatures(from osmCourse: OSMCourse?, for course: GolfCourse) {
         guard displayedCourse?.identifier == course.identifier, let osmCourse else { return }
-        courseFeatures = osmCourse.features
-        courseHoles = osmCourse.holes
-        courseTrees = osmCourse.trees.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        // OSM features arrive in arbitrary (dictionary) order, so the rough could
+        // composite over greens/fairways. Sort into a stable painter order so the
+        // turf stacks back-to-front (rough ▸ fairway ▸ green ▸ detail features);
+        // within the `.aboveRoads` level, declaration order is the z-order.
+        let sorted = visibleFeatures(in: osmCourse).sorted {
+            OverlayLayer.forFeature($0.kind).drawOrder < OverlayLayer.forFeature($1.kind).drawOrder
+        }
+        courseHoles = visibleHoles(in: osmCourse)
+
+        featureRenderTask?.cancel()
+        courseFeatures = []
+        featureRenderTask = Task {
+            await renderChunked(sorted, chunk: Self.featureRenderChunk, for: course) {
+                courseFeatures.append(contentsOf: $0)
+            }
+        }
+    }
+
+    /// Number of features appended per runloop turn during progressive rendering.
+    /// Sized so a single turn's MapKit mesh stays well under the 250 ms hang threshold.
+    private static let featureRenderChunk = 25
+    /// One ~display frame between chunks, so each batch commits and meshes before
+    /// the next is appended rather than coalescing back into one large update.
+    private static let renderFramePause: Duration = .milliseconds(16)
+
+    /// Appends `items` to a map-overlay array in `chunk`-sized batches, pausing one
+    /// frame between batches so MapKit meshes incrementally. Bails out if the render
+    /// is cancelled or the displayed course changes mid-flight, leaving the new
+    /// selection's overlays untouched.
+    private func renderChunked<T>(
+        _ items: [T],
+        chunk: Int,
+        for course: GolfCourse,
+        append: ([T]) -> Void
+    ) async {
+        guard !items.isEmpty else { return }
+        var start = 0
+        while start < items.count {
+            if Task.isCancelled || displayedCourse?.identifier != course.identifier { return }
+            let end = min(start + chunk, items.count)
+            append(Array(items[start..<end]))
+            start = end
+            if start < items.count {
+                try? await Task.sleep(for: Self.renderFramePause)
+            }
+        }
     }
 
     func ensureOSMData(for course: GolfCourse) async {
         let id = course.identifier
         osmLog("ensureOSMData start id=\(id) name=\(course.name)")
 
-        // If a fetch for this course is already running (e.g. a hover prefetch),
-        // join it rather than starting a second request. The owner task runs to
-        // completion independently of who started it, so a cancelled hover can't
-        // leave the click with no data — both apply the shared result.
+        // If a fetch for this course is already running, join it rather than
+        // starting a second request. The owner task runs to completion
+        // independently of who started it, so both callers apply the shared result.
         if let inflight = inFlightFetches[id] {
             osmLog("joining in-flight fetch id=\(id)")
             let result = try? await inflight.value
-            applyOutline(from: result ?? osmCache[id], for: course)
-            applyFeatures(from: result ?? osmCache[id], for: course)
+            drawCourse(result ?? osmCache[id], for: course)
             return
         }
 
@@ -408,11 +570,9 @@ struct ContentView: View {
             case "error" where age < errorTTL:
                 osmLog("cache hit (error within TTL), skipping fetch")
                 return
-            case "partial":
-                // Boundary is cached (and already drawn via cachedCourse), but the
-                // feature stage never completed — always refetch to finish it.
-                osmLog("cache partial, refetching to complete features")
             default:
+                // Includes legacy "partial" rows from the old two-stage fetch, which
+                // simply refetch to produce a complete course.
                 osmLog("cache stale, refetching")
             }
         } else {
@@ -420,8 +580,8 @@ struct ContentView: View {
         }
 
         // Start the owner task as an unstructured Task so it survives cancellation
-        // of whoever kicked it off (a hover prefetch is cancelled when the pointer
-        // leaves the row). It clears its own in-flight entry on completion.
+        // of whoever kicked it off (a selection the user moves past is cancelled).
+        // It clears its own in-flight entry on completion.
         let task = Task<OSMCourse?, Error> {
             defer { inFlightFetches[id] = nil }
             return await performOSMFetch(for: course, existing: existing)
@@ -436,8 +596,6 @@ struct ContentView: View {
     @discardableResult
     private func performOSMFetch(for course: GolfCourse, existing: OSMCourseData?) async -> OSMCourse? {
         let id = course.identifier
-        // Track the boundary so a Stage B failure can still persist Stage A's result.
-        var boundaryCourse: OSMCourse?
         var bestCourse: OSMCourse?
         do {
             osmLog("calling fetcher.fetch")
@@ -450,18 +608,12 @@ struct ContentView: View {
                 longitude: course.longitude
             ) {
                 switch stage {
-                case .boundary(let osmCourse):
-                    osmLog("stage boundary id=\(id) points=\(osmCourse.boundary.count)")
-                    boundaryCourse = osmCourse
-                    bestCourse = osmCourse
-                    applyOutline(from: osmCourse, for: course)
                 case .complete(let osmCourse):
                     let encoded = try JSONEncoder().encode(osmCourse)
                     logOSMCourse(osmCourse, encoded: encoded, identifier: id)
                     osmCache[id] = osmCourse
                     bestCourse = osmCourse
-                    applyOutline(from: osmCourse, for: course)
-                    applyFeatures(from: osmCourse, for: course)
+                    drawCourse(osmCourse, for: course)
                     upsertOSMData(courseIdentifier: id, encoded: encoded, status: "ok", existing: existing)
                 case .notFound:
                     osmLog("notFound id=\(id) name=\(course.name)")
@@ -469,13 +621,14 @@ struct ContentView: View {
                 }
             }
         } catch {
+            if error is CancellationError || Task.isCancelled {
+                // The user selected a different course before this one finished.
+                // Whatever already drew/persisted stays put — just stop here.
+                osmLog("fetch cancelled id=\(id)")
+                return bestCourse
+            }
             osmLog("error id=\(id) name=\(course.name): \(error)")
-            if let boundaryCourse, let encoded = try? JSONEncoder().encode(boundaryCourse) {
-                // Stage A succeeded before the failure — keep the boundary so the
-                // course still renders its outline and refetches features next time.
-                osmCache[id] = boundaryCourse
-                upsertOSMData(courseIdentifier: id, encoded: encoded, status: "partial", existing: existing)
-            } else if case OSMFetchError.rateLimited = error {
+            if case OSMFetchError.rateLimited = error {
                 // Transient: don't poison the cache. Leave any existing row intact
                 // (or none) so the next selection retries immediately.
             } else if case OSMFetchError.transport = error {
@@ -493,7 +646,6 @@ struct ContentView: View {
         osmLog("      boundary points: \(osmCourse.boundary.count)")
         osmLog("      holes: \(osmCourse.holes.count)")
         osmLog("      features: \(osmCourse.features.count)")
-        osmLog("      trees: \(osmCourse.trees.count)")
 
         let pretty = JSONEncoder()
         pretty.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -592,21 +744,25 @@ struct ContentView: View {
             if !favorites.isEmpty {
                 Section("Favorites") {
                     ForEach(favorites) { favorite in
-                        courseRow(course: favorite.asGolfCourse, subtitle: nil)
-                            .tag(SidebarSelection.favorite(favorite.asGolfCourse))
+                        let course = favorite.asGolfCourse
+                        courseRow(course: course, subtitle: nil)
+                            .tag(SidebarSelection.favorite(course))
+                        subCourseRows(for: course)
                     }
                 }
             }
             if !recents.isEmpty {
                 Section("Recents") {
                     ForEach(recents) { recent in
-                        courseRow(course: recent.asGolfCourse, subtitle: nil)
-                            .tag(SidebarSelection.recent(recent.asGolfCourse))
+                        let course = recent.asGolfCourse
+                        courseRow(course: course, subtitle: nil)
+                            .tag(SidebarSelection.recent(course))
                             .contextMenu {
                                 Button("Remove from Recents", systemImage: "trash", role: .destructive) {
                                     deleteRecent(recent)
                                 }
                             }
+                        subCourseRows(for: course)
                     }
                 }
             }
@@ -615,6 +771,7 @@ struct ContentView: View {
                     ForEach(searchResults) { course in
                         courseRow(course: course, subtitle: course.city.isEmpty ? nil : course.city)
                             .tag(SidebarSelection.result(course))
+                        subCourseRows(for: course)
                     }
                 }
             }
@@ -643,28 +800,59 @@ struct ContentView: View {
             .buttonStyle(.plain)
         }
         .contentShape(Rectangle())
-        .onHover { hovering in
-            prefetchOnHover(hovering, course: course)
+    }
+
+    /// Indented child rows for a multi-course facility, emitted right beneath its
+    /// sidebar row. Each is a button (not a `List` selection) that activates its
+    /// sub-course, so the `List` selection stays on the facility while the active
+    /// sub-course is reflected here and in the on-map picker. Hidden unless `course`
+    /// is the displayed facility and it has more than one sub-course.
+    @ViewBuilder
+    func subCourseRows(for course: GolfCourse) -> some View {
+        if isDisplayedFacility(course), displayedSubCourses.count > 1 {
+            Button {
+                activeSubCourseID = nil
+            } label: {
+                HStack {
+                    Label("All Courses", systemImage: "square.stack")
+                        .font(.subheadline)
+                        .lineLimit(1)
+                    Spacer()
+                    if activeSubCourseID == nil {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(.tint)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, 16)
+            ForEach(displayedSubCourses) { sub in
+                Button {
+                    activeSubCourseID = sub.id
+                } label: {
+                    HStack {
+                        Label(sub.name ?? "Course", systemImage: "flag")
+                            .font(.subheadline)
+                            .lineLimit(1)
+                        Spacer()
+                        if activeSubCourseID == sub.id {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 16)
+            }
         }
     }
 
-    /// Warms the OSM cache when the pointer rests on a row, so a subsequent click
-    /// usually finds the data already cached. A short debounce avoids firing for
-    /// rows the pointer merely passes over; the actor's in-flight dedup coalesces a
-    /// hover prefetch with the click that follows.
-    func prefetchOnHover(_ hovering: Bool, course: GolfCourse) {
-        let id = course.identifier
-        guard hovering else {
-            hoverPrefetchTasks[id]?.cancel()
-            hoverPrefetchTasks[id] = nil
-            return
-        }
-        guard hoverPrefetchTasks[id] == nil else { return }
-        hoverPrefetchTasks[id] = Task {
-            try? await Task.sleep(for: .milliseconds(300))
-            if Task.isCancelled { return }
-            await ensureOSMData(for: course)
-        }
+    /// Whether `course` is the course currently shown on the map — the only one
+    /// whose (post-fetch) sub-courses we know about.
+    private func isDisplayedFacility(_ course: GolfCourse) -> Bool {
+        displayedCourse?.identifier == course.identifier
     }
 }
 

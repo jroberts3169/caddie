@@ -15,7 +15,6 @@ import AppKit
 enum OverlayLayer: String, CaseIterable, Identifiable {
     case boundary
     case holes
-    case trees
     case green
     case fairway
     case tee
@@ -28,8 +27,8 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Course-wide structure overlays (boundary outline, hole centerlines, trees).
-    static let structureLayers: [OverlayLayer] = [.boundary, .holes, .trees]
+    /// Course-wide structure overlays (boundary outline, hole centerlines).
+    static let structureLayers: [OverlayLayer] = [.boundary, .holes]
     /// Per-feature fills/strokes mapped from `OSMFeature.Kind`.
     static let featureLayers: [OverlayLayer] = [
         .green, .fairway, .tee, .bunker, .rough, .water, .path, .drivingRange, .unknown,
@@ -39,7 +38,6 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         switch self {
         case .boundary: return "Course Boundary"
         case .holes: return "Holes"
-        case .trees: return "Trees"
         case .green: return "Greens"
         case .fairway: return "Fairways"
         case .tee: return "Tees"
@@ -59,7 +57,6 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         switch self {
         case .boundary: return .white
         case .holes: return Color(.courseHole)
-        case .trees: return Color(.courseTree)
         case .green: return Color(.courseGreen)
         case .fairway: return Color(.courseFairway)
         case .tee: return Color(.courseTee)
@@ -69,6 +66,31 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         case .path: return Color(.coursePath)
         case .drivingRange: return Color(.courseDrivingRange)
         case .unknown: return Color(.courseUnknown)
+        }
+    }
+
+    /// Painter order for the feature overlays that share the `.aboveRoads` map
+    /// level. Lower values are drawn first (further back); higher values
+    /// composite on top. Tuned so the visible stack reads, top to bottom:
+    /// hole line ▸ greens ▸ fairways ▸ rough — the broad turf areas sit at the
+    /// back, with the smaller detail features (tees, bunkers, water, cart paths)
+    /// layered on top of the turf they sit within. The hole centerlines render
+    /// at `.aboveLabels`, so they always stay above every feature here.
+    var drawOrder: Int {
+        switch self {
+        case .rough: return 0
+        case .drivingRange: return 1
+        case .fairway: return 2
+        case .green: return 3
+        case .tee: return 4
+        case .bunker: return 5
+        case .water: return 6
+        case .path: return 7
+        case .unknown: return 8
+        // Structure layers render in their own passes, not the feature loop,
+        // so these only matter if the value is ever read for them.
+        case .boundary: return -1
+        case .holes: return 99
         }
     }
 

@@ -12,11 +12,9 @@ nonisolated func osmLog(_ message: @autoclosure () -> String) {
     #endif
 }
 
-/// Progressive stages emitted while fetching a course: the boundary lands first
-/// (from a cheap query) so it can paint immediately, then the full course with all
-/// features follows.
+/// Result of fetching a course: the complete course (boundary + holes + features)
+/// in a single request, or `notFound` when no matching golf course exists in OSM.
 enum OSMFetchStage {
-    case boundary(OSMCourse)
     case complete(OSMCourse)
     case notFound
 }
@@ -54,13 +52,14 @@ actor OSMFetcher {
         self.session = session
     }
 
-    /// Public entry point. Streams the boundary first, then the full course.
-    /// The stream finishes without emitting if a fetch is already in-flight.
+    /// Public entry point. Fetches the complete course in a single request and
+    /// emits it as one `.complete` result (or `.notFound`). The stream finishes
+    /// without emitting if a fetch for the same course is already in-flight.
     nonisolated func fetch(identifier: String, name: String, latitude: Double, longitude: Double) -> AsyncThrowingStream<OSMFetchStage, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.runStagedFetch(
+                    try await self.runFetch(
                         identifier: identifier,
                         name: name,
                         latitude: latitude,
@@ -76,9 +75,11 @@ actor OSMFetcher {
         }
     }
 
-    /// Drives the two-stage fetch on the actor: dedup + throttle, then a cheap
-    /// boundary query followed by the full features query.
-    private func runStagedFetch(
+    /// Drives the fetch on the actor: dedup + throttle, then a single query for the
+    /// course plus every golf feature. The features response already carries the
+    /// course boundary (the `leisure=golf_course` element with inline geometry), so
+    /// one round-trip yields the complete drawable course.
+    private func runFetch(
         identifier: String,
         name: String,
         latitude: Double,
@@ -89,24 +90,27 @@ actor OSMFetcher {
         inFlight.insert(identifier)
         defer { inFlight.remove(identifier) }
 
+        let gapStart = Date()
         try await waitForGap()
-        lastRequestStartedAt = .now
+        let gapMs = Int(Date().timeIntervalSince(gapStart) * 1000)
+        osmLog("timing id=\(identifier) throttle-gap=\(gapMs)ms (minGap=\(String(format: "%.1f", minGap))s)")
 
-        // Stage A — boundary only. Small, single-feature query that paints fast.
-        let boundaryResponse = try await post(boundaryQuery(name: name, latitude: latitude, longitude: longitude))
-        guard let boundaryCourse = OSMCourseBuilder.makeCourse(from: boundaryResponse) else {
+        let fetchStart = Date()
+        let response = try await post(featuresQuery(name: name, latitude: latitude, longitude: longitude))
+        osmLog("timing id=\(identifier) fetch-features=\(Int(Date().timeIntervalSince(fetchStart) * 1000))ms")
+        guard let course = OSMCourseBuilder.makeCourse(from: response, matching: name) else {
             yield(.notFound)
             return
         }
-        yield(.boundary(boundaryCourse))
-
-        // Stage B — the full course with every golf feature.
-        let fullResponse = try await post(fullQuery(name: name, latitude: latitude, longitude: longitude))
-        yield(.complete(OSMCourseBuilder.makeCourse(from: fullResponse) ?? boundaryCourse))
+        yield(.complete(course))
     }
 
     /// Posts a query and adjusts throttling: relax on success, back off on rate limit.
+    /// Stamps `lastRequestStartedAt` per call so the inter-fetch gap is measured
+    /// against the most recent network request, not just the first stage of the
+    /// previous course.
     private func post(_ query: String) async throws -> OverpassResponse {
+        lastRequestStartedAt = .now
         do {
             let response = try await postWithFailover(query: query)
             minGap = max(baseMinGap, minGap / 2)
@@ -142,25 +146,10 @@ actor OSMFetcher {
 
     // MARK: - Query construction
 
-    /// Cheap query: just the course boundary way/relation, geometry inlined.
-    private func boundaryQuery(name: String, latitude: Double, longitude: Double) -> String {
-        let bboxString = bboxString(latitude: latitude, longitude: longitude)
-        let namePattern = escapeForOverpassRegex(simplifyName(name))
-
-        return """
-        [out:json][timeout:30];
-        (
-          way["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
-          relation["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
-        );
-        out geom;
-        """
-    }
-
-    /// Full query: the course plus every golf feature INSIDE the course polygon.
+    /// Features query: the course plus every golf feature INSIDE the course polygon.
     /// Uses `map_to_area` so interior holes/greens (far from the boundary line) are
     /// included — `around.course:N` only catches features near the perimeter.
-    private func fullQuery(name: String, latitude: Double, longitude: Double) -> String {
+    private func featuresQuery(name: String, latitude: Double, longitude: Double) -> String {
         let bboxString = bboxString(latitude: latitude, longitude: longitude)
         let namePattern = escapeForOverpassRegex(simplifyName(name))
 
@@ -169,14 +158,28 @@ actor OSMFetcher {
         (
           way["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
           relation["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
-        )->.course;
+        )->.named;
+        // A multi-course facility (e.g. Balboa Park) is a `type=multipolygon` whose
+        // member ways ARE the sub-courses (Championship as `outer`, Executive as
+        // `inner`). Fold those member ways in alongside the named matches so the area
+        // set below is the UNION of the facility and each sub-course — otherwise the
+        // inner sub-course is cut out of the donut area and its holes/features are
+        // never returned.
+        way(r.named)->.members;
+        (.named; .members;)->.course;
         .course map_to_area->.courseArea;
         (
           .course;
           way(area.courseArea)["golf"];
           node(area.courseArea)["golf"];
           relation(area.courseArea)["golf"];
-          node(area.courseArea)["natural"="tree"];
+          // Child course polygons of a multi-course facility, which carry no `golf=*`
+          // tag and rarely share the facility name, so neither the name match nor the
+          // `golf` clauses above return them: nested sibling ways via the area set,
+          // and multipolygon members via the relation recursion.
+          way(area.courseArea)["leisure"="golf_course"];
+          relation(area.courseArea)["leisure"="golf_course"];
+          way(r.named);
         );
         out geom;
         """
