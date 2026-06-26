@@ -18,6 +18,7 @@ nonisolated func osmLog(_ message: @autoclosure () -> String) {
 enum OSMFetchStage {
     case boundary(OSMCourse)
     case complete(OSMCourse)
+    case trees([Coordinate])
     case notFound
 }
 
@@ -76,8 +77,10 @@ actor OSMFetcher {
         }
     }
 
-    /// Drives the two-stage fetch on the actor: dedup + throttle, then a cheap
-    /// boundary query followed by the full features query.
+    /// Drives the staged fetch on the actor: dedup + throttle, then a cheap
+    /// boundary query, the golf features (so the overlays paint), and finally the
+    /// `natural=tree` nodes — which for wooded courses are by far the heaviest part
+    /// of the response, so they stream last instead of blocking the overlays.
     private func runStagedFetch(
         identifier: String,
         name: String,
@@ -90,7 +93,6 @@ actor OSMFetcher {
         defer { inFlight.remove(identifier) }
 
         try await waitForGap()
-        lastRequestStartedAt = .now
 
         // Stage A — boundary only. Small, single-feature query that paints fast.
         let boundaryResponse = try await post(boundaryQuery(name: name, latitude: latitude, longitude: longitude))
@@ -100,13 +102,28 @@ actor OSMFetcher {
         }
         yield(.boundary(boundaryCourse))
 
-        // Stage B — the full course with every golf feature.
-        let fullResponse = try await post(fullQuery(name: name, latitude: latitude, longitude: longitude))
-        yield(.complete(OSMCourseBuilder.makeCourse(from: fullResponse) ?? boundaryCourse))
+        // Stage B — the course plus every golf feature, but NOT trees. This is what
+        // draws the fairways/greens/holes, so keeping the tree dump out of it makes
+        // the overlays appear quickly.
+        let featuresResponse = try await post(featuresQuery(name: name, latitude: latitude, longitude: longitude))
+        let featuresCourse = OSMCourseBuilder.makeCourse(from: featuresResponse) ?? boundaryCourse
+        yield(.complete(featuresCourse))
+
+        // Stage C — trees, streamed last. Thousands of nodes on a wooded course, so
+        // this is the slow part; the overlays are already on screen by now.
+        let treesResponse = try await post(treesQuery(name: name, latitude: latitude, longitude: longitude))
+        let trees = OSMCourseBuilder.treeCoordinates(from: treesResponse, boundary: featuresCourse.boundary)
+        if !trees.isEmpty {
+            yield(.trees(trees))
+        }
     }
 
     /// Posts a query and adjusts throttling: relax on success, back off on rate limit.
+    /// Stamps `lastRequestStartedAt` per call so the inter-fetch gap is measured
+    /// against the most recent network request, not just the first stage of the
+    /// previous course.
     private func post(_ query: String) async throws -> OverpassResponse {
+        lastRequestStartedAt = .now
         do {
             let response = try await postWithFailover(query: query)
             minGap = max(baseMinGap, minGap / 2)
@@ -157,10 +174,12 @@ actor OSMFetcher {
         """
     }
 
-    /// Full query: the course plus every golf feature INSIDE the course polygon.
-    /// Uses `map_to_area` so interior holes/greens (far from the boundary line) are
-    /// included — `around.course:N` only catches features near the perimeter.
-    private func fullQuery(name: String, latitude: Double, longitude: Double) -> String {
+    /// Features query: the course plus every golf feature INSIDE the course polygon,
+    /// EXCLUDING trees. Uses `map_to_area` so interior holes/greens (far from the
+    /// boundary line) are included — `around.course:N` only catches features near the
+    /// perimeter. Trees are fetched separately (see `treesQuery`) because their node
+    /// count dwarfs everything else and would delay the overlays.
+    private func featuresQuery(name: String, latitude: Double, longitude: Double) -> String {
         let bboxString = bboxString(latitude: latitude, longitude: longitude)
         let namePattern = escapeForOverpassRegex(simplifyName(name))
 
@@ -176,8 +195,26 @@ actor OSMFetcher {
           way(area.courseArea)["golf"];
           node(area.courseArea)["golf"];
           relation(area.courseArea)["golf"];
-          node(area.courseArea)["natural"="tree"];
         );
+        out geom;
+        """
+    }
+
+    /// Trees query: just the `natural=tree` nodes inside the course polygon. Run as
+    /// the final stage so the (often very large) tree set streams in after the
+    /// overlays are already drawn.
+    private func treesQuery(name: String, latitude: Double, longitude: Double) -> String {
+        let bboxString = bboxString(latitude: latitude, longitude: longitude)
+        let namePattern = escapeForOverpassRegex(simplifyName(name))
+
+        return """
+        [out:json][timeout:30];
+        (
+          way["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
+          relation["leisure"="golf_course"]["name"~"\(namePattern)",i](\(bboxString));
+        )->.course;
+        .course map_to_area->.courseArea;
+        node(area.courseArea)["natural"="tree"];
         out geom;
         """
     }

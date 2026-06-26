@@ -55,6 +55,21 @@ nonisolated struct OSMCourse: Codable, Hashable {
         features = try c.decode([OSMFeature].self, forKey: .features)
         trees = try c.decodeIfPresent([Coordinate].self, forKey: .trees) ?? []
     }
+
+    /// Returns a copy with the trees replaced — used when trees arrive in a separate
+    /// final fetch stage after the features have already been drawn and cached.
+    func withTrees(_ trees: [Coordinate]) -> OSMCourse {
+        OSMCourse(
+            osmIdentifier: osmIdentifier,
+            osmType: osmType,
+            name: name,
+            tags: tags,
+            boundary: boundary,
+            holes: holes,
+            features: features,
+            trees: trees
+        )
+    }
 }
 
 nonisolated struct OSMHole: Codable, Hashable {
@@ -354,6 +369,16 @@ nonisolated enum OSMCourseBuilder {
             .filter { ($0.tags?["natural"]) == "tree" }
             .map { Coordinate(lat: $0.lat, lon: $0.lon) }
             .filter { isInside($0, polygon: boundary) }
+    }
+
+    /// Extracts tree coordinates from a standalone trees response (the final fetch
+    /// stage), clipped to the course boundary.
+    static func treeCoordinates(from response: OverpassResponse, boundary: [Coordinate]) -> [Coordinate] {
+        var nodesByID: [Int64: OverpassNode] = [:]
+        for element in response.elements {
+            if case .node(let n) = element { nodesByID[n.id] = n }
+        }
+        return trees(from: nodesByID, boundary: boundary)
     }
 
     /// Ray-casting point-in-polygon test. Treats lon as x and lat as y.

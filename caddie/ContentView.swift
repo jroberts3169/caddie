@@ -238,6 +238,12 @@ struct ContentView: View {
                 longitudinalMeters: 2000
             ))
             recordRecent(course)
+            // Cancel any in-flight fetch for a course the user has already moved past
+            // — almost always its slow trees stage — so the new selection doesn't have
+            // to compete with it for the same Overpass mirror.
+            for (id, task) in inFlightFetches where id != course.identifier {
+                task.cancel()
+            }
             // Draw whatever is already cached immediately, then progressively
             // refresh from the network (boundary first, features after).
             let cached = cachedCourse(for: course)
@@ -373,6 +379,12 @@ struct ContentView: View {
         courseTrees = osmCourse.trees.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
     }
 
+    /// Assigns just the trees (the final, late-arriving fetch stage), ignoring stale
+    /// results for a course that is no longer the displayed one.
+    func applyTrees(from osmCourse: OSMCourse?, for course: GolfCourse) {
+        guard displayedCourse?.identifier == course.identifier, let osmCourse else { return }
+        courseTrees = osmCourse.trees.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+    }
     func ensureOSMData(for course: GolfCourse) async {
         let id = course.identifier
         osmLog("ensureOSMData start id=\(id) name=\(course.name)")
@@ -469,12 +481,31 @@ struct ContentView: View {
                     applyOutline(from: osmCourse, for: course)
                     applyFeatures(from: osmCourse, for: course)
                     upsertOSMData(courseIdentifier: id, encoded: encoded, status: "ok", existing: existing)
+                case .trees(let trees):
+                    osmLog("stage trees id=\(id) count=\(trees.count)")
+                    // Merge the late-arriving trees into the already-drawn course and
+                    // re-persist so a cache re-selection includes them.
+                    guard let base = bestCourse else { break }
+                    let merged = base.withTrees(trees)
+                    osmCache[id] = merged
+                    bestCourse = merged
+                    applyTrees(from: merged, for: course)
+                    if let encoded = try? JSONEncoder().encode(merged) {
+                        upsertOSMData(courseIdentifier: id, encoded: encoded, status: "ok", existing: existing)
+                    }
                 case .notFound:
                     osmLog("notFound id=\(id) name=\(course.name)")
                     upsertOSMData(courseIdentifier: id, encoded: nil, status: "notFound", existing: existing)
                 }
             }
         } catch {
+            if error is CancellationError || Task.isCancelled {
+                // The user selected a different course before this one finished.
+                // Whatever earlier stages already drew/persisted stays put — just
+                // stop here without writing a "partial" that would clobber an "ok".
+                osmLog("fetch cancelled id=\(id)")
+                return bestCourse
+            }
             osmLog("error id=\(id) name=\(course.name): \(error)")
             if let boundaryCourse, let encoded = try? JSONEncoder().encode(boundaryCourse) {
                 // Stage A succeeded before the failure — keep the boundary so the
