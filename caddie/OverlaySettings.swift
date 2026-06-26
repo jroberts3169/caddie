@@ -15,7 +15,6 @@ import AppKit
 enum OverlayLayer: String, CaseIterable, Identifiable {
     case boundary
     case holes
-    case trees
     case green
     case fairway
     case tee
@@ -28,8 +27,8 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Course-wide structure overlays (boundary outline, hole centerlines, trees).
-    static let structureLayers: [OverlayLayer] = [.boundary, .holes, .trees]
+    /// Course-wide structure overlays (boundary outline, hole centerlines).
+    static let structureLayers: [OverlayLayer] = [.boundary, .holes]
     /// Per-feature fills/strokes mapped from `OSMFeature.Kind`.
     static let featureLayers: [OverlayLayer] = [
         .green, .fairway, .tee, .bunker, .rough, .water, .path, .drivingRange, .unknown,
@@ -39,7 +38,6 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         switch self {
         case .boundary: return "Course Boundary"
         case .holes: return "Holes"
-        case .trees: return "Trees"
         case .green: return "Greens"
         case .fairway: return "Fairways"
         case .tee: return "Tees"
@@ -59,7 +57,6 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         switch self {
         case .boundary: return .white
         case .holes: return Color(.courseHole)
-        case .trees: return Color(.courseTree)
         case .green: return Color(.courseGreen)
         case .fairway: return Color(.courseFairway)
         case .tee: return Color(.courseTee)
@@ -93,7 +90,6 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         // Structure layers render in their own passes, not the feature loop,
         // so these only matter if the value is ever read for them.
         case .boundary: return -1
-        case .trees: return 98
         case .holes: return 99
         }
     }

@@ -135,3 +135,58 @@ and lay the groundwork to progressively draw the rest of the OSM objects
   added a `Color` extension defining them so the build stays green.
 
 ## All phases complete.
+## Multi-course facility support (selectable sub-courses)
+
+- [x] Fetch child course  `featuresQuery` folds the matched relation'spolygons 
+      member ways into the area set (`way(r.named)` + union `map_to_area`) so a
+      multipolygon facility's inner-ring sub-course and its holes are returned.
+- [x]  `OSMSubCourse` + `OSMCourse.subCourses`; resilient `init(from:)`Model 
+      (`decodeIfPresent(subCourses) ?? []`) so legacy cache rows still decode.
+- [x]  `makeSubCourses` unions relation membership (primary signal)Detection 
+      with spatial containment; primary = largest boundary, relation wins ties.
+- [x]  re-added `GolfGeometry` (`isInside`, `ringArea`, `centroid`).Geometry 
+- [x] State/ `activeSubCourseID` + `displayedSubCourses`; outline/holes/render 
+      features filtered to the active sub-course; holes/features attributed to the
+      SMALLEST containing sub-course; `.onChange(of: activeSubCourseID)` re-renders.
+- [x]  `subCourseRows(for:)` indented child buttons under the displayedSidebar 
+      facility (List selection stays on the facility).
+- [x] On- floating segmented `subCoursePicker`, shown when > 1 sub-course.map 
+- [x]  `docs/ui-glossary.2.4 Sub-Course 3.2 Sub-Course Picker.Rows, md` Docs 
+
+### Review
+- Verified end-to-end against LIVE Overpass: Balboa returns relation 3573430 +
+  member ways Championship (`outer`) + Executive (`inner`); a Python mirror of
+  `makeCourse` yields sub-courses [Championship, Executive] with holes attributed
+  30 / 9 (the 39 total is genuine OSM duplicate hole mappings, pre-existing).
+- KEY CORRECTION (see tasks/lessons.md): spatial containment alone was wrong 
+  Balboa's outer/inner members are geographically disjoint; membership is the
+  real signal. `map_to_area` of the multipolygon is a donut, so member ways must
+  be mapped to areas too or the inner sub-course's holes never come back.
+- Debug build (OSM_DEBUG) `** BUILD SUCCEEDED **`. Coronado preserved: driving
+  range still excluded by `isCourseBoundary`, so single courses show no picker.
+- Not yet exercised in the running  needs interactive click-through.GUI 
+- All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.
+
+## Generalize sub-course detection (Augusta tag-tier + hulls)
+- [x] Phase  name-matched primary (`OSMFetcher` threads search name; builder prefers name match, area tie-break, largest fallback)0 
+- [x] Phase  `OSMSubCourse` reshaped: `id: String`, `holeIDs`/`featureIDs` precomputed at build time1 
+ convex hull boundary; Tier 2 polygons; `GolfGeometry.convexHull` + `buffered`
+- [x] Phase  render is pure membership filtering (`visibleHoles`/`visibleFeatures` by IDs; deleted render-time `smallestSubCourse`); `activeSubCourseID: String?`3 
+- [x] Phase  picker/sidebar bind to `id: String`4 
+- [x] Phase  verified live + Debug build SUCCEEDED5 
+
+### Review
+- Verified against LIVE Overpass via Python mirror of the new builder:
+  - ** primary correctly resolves to "Augusta National Golf Club"Augusta** 
+    (name-matched; beat the swept-in "Augusta Country Club" on the area tie-break).
+    Tier 1 splits into "Augusta National" (18 holes / 116 features, hull 7.7e-5) and
+    "Par 3 Course" (9 holes / 23 features, hull 6.5e- distinct hulls, features6) 
+    split by smallest containing hull.
+ Championship (30) + Executive (9).
+  - ** Tier 3 single course (driving range excluded, no  no picker.tag) Coronado** 
+- Attribution moved to BUILD time (`holeIDs`/`featureIDs`); render is now a pure
+  Set-membership filter. Deleted the render-time geometry helper `smallestSubCourse`.
+- Phase 0 fixes a latent bug: the primary was "largest boundary in the response",
+  so a larger neighbouring club could have hijacked the displayed course.
+- Debug build `** BUILD SUCCEEDED **`. Not yet exercised in the running GUI.
+- All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.

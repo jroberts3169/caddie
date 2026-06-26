@@ -16,8 +16,10 @@ lives in [caddie/ContentView.swift](../caddie/ContentView.swift), hosted by
   - [2.1 Search Field](#21-search-field)
   - [2.2 Sidebar Sections](#22-sidebar-sections)
   - [2.3 Course Row](#23-course-row)
+  - [2.4 Sub-Course Rows](#24-sub-course-rows)
 - [3. Map Detail Pane](#3-map-detail-pane)
   - [3.1 Map Overlay Layers](#31-map-overlay-layers)
+  - [3.2 Sub-Course Picker](#32-sub-course-picker)
 - [4. Overlay Settings Window](#4-overlay-settings-window)
 - [5. Behaviors](#5-behaviors)
   - [5.1 Selection](#51-selection)
@@ -95,7 +97,8 @@ a sidebar and a map detail pane.
 | --- | --- | --- | --- |
 | Satellite map surface | **Map Surface** | Always | Realistic imagery map |
 | Pin on the selected course | **Course Marker** | Only when a course is displayed | Marks the selected course coordinate |
-| Drawn OSM geometry | **Map Overlay Layers** | Per layer, when fetched and the layer is enabled | Boundary, holes, trees, and course-feature fills (see [§3.1](#31-map-overlay-layers)) |
+| Drawn OSM geometry | **Map Overlay Layers** | Per layer, when fetched and the layer is enabled | Boundary, holes, and course-feature fills (see [§3.1](#31-map-overlay-layers)) |
+| Floating segmented switcher | **Sub-Course Picker** | Only when the displayed facility has more than one sub-course | Switches the active sub-course of a multi-course facility (see [§3.2](#32-sub-course-picker)) |
 
 > The color and visibility of every **Map Overlay Layer** are user-configurable in
 > the **Overlay Settings Window** (see [§4](#4-overlay-settings-window)), opened
@@ -152,6 +155,30 @@ A single row rendered by `courseRow(course:subtitle:)`
 > Section** rows pass `subtitle: nil` (no **City Subtitle Label**); only
 > **Results Section** rows show a city.
 
+### 2.4 Sub-Course Rows
+
+Indented child rows emitted by `subCourseRows(for:)` directly beneath the
+**Course Row** of the currently displayed facility, one per sub-course.
+
+```
+┌─────────────────────────────────────────────┐
+│ Balboa Park Golf Course        ⭐           │  ← Course Row (facility)
+│   ⚑ Championship Course            ✓        │  ← Sub-Course Row (active)
+│   ⚑ Executive Course                        │  ← Sub-Course Row
+└─────────────────────────────────────────────┘
+```
+
+| Element | Canonical name | Icon / Source | Notes |
+| --- | --- | --- | --- |
+| Indented sub-course button | **Sub-Course Row** | `flag`, `subCourseRows(for:)` in [ContentView.swift](../caddie/ContentView.swift) | One per `displayedSubCourses` entry; sets `activeSubCourseID` |
+| Trailing check on the active row | **Sub-Course Checkmark** | `checkmark`, [ContentView.swift](../caddie/ContentView.swift) | Tint-colored; marks the active sub-course |
+
+> **Sub-Course Rows** appear only beneath the **displayed facility** and only
+> when it has more than one sub-course. They are buttons, not `List` selections —
+> the `List` selection stays on the facility while the active sub-course is shown
+> here and in the **Sub-Course Picker**, which stay in sync. An ordinary single
+> course shows no **Sub-Course Rows**.
+
 ---
 
 ## 3. Map Detail Pane
@@ -163,8 +190,8 @@ Source: the `detail:` closure in [ContentView.swift](../caddie/ContentView.swift
 | Map view | **Map Surface** | [ContentView.swift](../caddie/ContentView.swift#L163-L168) | `Map(position:)` with `.mapStyle(.imagery(elevation: .realistic))` — 3D satellite imagery |
 | Selected-course pin | **Course Marker** | [ContentView.swift](../caddie/ContentView.swift#L164-L166) | A `Marker` labeled with the course name at the course coordinate; only rendered when `displayedCourse` is non-nil |
 
-> The **Map Surface** also draws **Map Overlay Layers** (boundary, holes, trees,
-> and per-feature fills) for the selected course's OSM geometry. Each layer's
+> The **Map Surface** also draws **Map Overlay Layers** (boundary, holes, and
+> per-feature fills) for the selected course's OSM geometry. Each layer's
 > color and on/off state come from the **Overlay Settings Window** ([§4](#4-overlay-settings-window)).
 
 ### 3.1 Map Overlay Layers
@@ -179,7 +206,6 @@ Window**.
 | Course outline polygon stroke | **Course Boundary Overlay** | [ContentView.swift](../caddie/ContentView.swift#L187-L191) | White | Course Boundary |
 | Dashed tee→green centerline | **Hole Centerline** | [ContentView.swift](../caddie/ContentView.swift#L276-L289) | `CourseHole` | Holes |
 | Numbered marker at each tee | **Hole Tee Marker** | [ContentView.swift](../caddie/ContentView.swift#L285-L288) | `CourseHole` | Holes |
-| Small circle per tree | **Tree Dot** | [ContentView.swift](../caddie/ContentView.swift#L196-L201) | `CourseTree` | Trees |
 | Filled/stroked feature geometry | **Feature Overlay** | [ContentView.swift](../caddie/ContentView.swift#L254-L271) | Per kind (below) | Per kind (below) |
 
 The **Feature Overlay** is one shape per OSM feature, colored by kind. Closed
@@ -201,6 +227,29 @@ areas render as a translucent filled polygon; open paths as a stroked polyline.
 > Window**. The nine **Feature Overlay** kinds collapse cart paths and generic
 > paths onto a single **Cart Paths** layer.
 
+### 3.2 Sub-Course Picker
+
+A floating segmented control over the bottom of the **Map Surface**, produced by
+the `subCoursePicker` view, for facilities that contain more than one course
+(e.g. Balboa Park's Championship and Executive courses).
+
+```
+              ┌───────────────────────────────┐
+              │  Championship  │   Executive   │  ← Sub-Course Picker
+              └───────────────────────────────┘
+```
+
+| Element | Canonical name | Source | Notes |
+| --- | --- | --- | --- |
+| Segmented course switcher | **Sub-Course Picker** | `subCoursePicker` in [ContentView.swift](../caddie/ContentView.swift) | `.pickerStyle(.segmented)` in a `.regularMaterial` capsule; bound to `activeSubCourseID` |
+| One segment per sub-course | **Sub-Course Segment** | [ContentView.swift](../caddie/ContentView.swift) | Label is the sub-course name with a trailing "Course"/"Golf Course" trimmed |
+
+> The **Sub-Course Picker** is hidden unless `displayedSubCourses.count > 1`. It
+> mirrors the **Sub-Course Rows** in the sidebar ([§2.4](#24-sub-course-rows)) —
+> both read and write `activeSubCourseID`, so switching from either updates the
+> other and re-filters the **Map Overlay Layers** to the active sub-course's own
+> boundary and the holes/features that fall inside it.
+
 ---
 
 ## 4. Overlay Settings Window
@@ -216,8 +265,7 @@ store (persisted to `UserDefaults`).
 │ Course Structure                                │  ← Course Structure Section
 │   ⬛  Course Boundary               ●━━━○        │  ← Overlay Layer Row
 │   ⬛  Holes                         ●━━━○        │
-│   ⬛  Trees                         ●━━━○        │
-│ Boundary outline, hole centerlines, and trees.  │
+│ Boundary outline and hole centerlines.          │
 │                                                 │
 │ Course Features                                 │  ← Course Features Section
 │   ⬛  Greens                        ●━━━○        │
@@ -232,7 +280,7 @@ store (persisted to `UserDefaults`).
 | Element | Canonical name | Source | Notes |
 | --- | --- | --- | --- |
 | Whole settings window | **Overlay Settings Window** | [caddieApp.swift](../caddie/caddieApp.swift#L40-L43), [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | A grouped `Form` in the `Settings` scene; fixed 440×560 |
-| "Course Structure" group | **Course Structure Section** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Boundary, Holes, Trees rows |
+| "Course Structure" group | **Course Structure Section** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Boundary, Holes rows |
 | "Course Features" group | **Course Features Section** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | The nine feature-kind rows |
 | One layer's row | **Overlay Layer Row** | [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Color well + name + visibility switch |
 | Leading color picker well | **Layer Color Well** | `ColorPicker`, [OverlaySettingsView.swift](../caddie/OverlaySettingsView.swift) | Opens the system color panel; supports opacity |

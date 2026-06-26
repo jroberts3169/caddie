@@ -17,7 +17,7 @@ struct OverlaySettingsView: View {
             } header: {
                 Text("Course Structure")
             } footer: {
-                Text("Boundary outline, hole centerlines, and trees.")
+                Text("Boundary outline and hole centerlines.")
             }
 
             Section("Course Features") {
