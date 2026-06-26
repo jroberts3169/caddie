@@ -154,7 +154,7 @@ struct ContentView: View {
     @State private var searchResults: [GolfCourse] = []
     @State private var selection: SidebarSelection?
     @State private var displayedCourse: GolfCourse?
-    @State private var courseOutline: [CLLocationCoordinate2D] = []
+    @State private var courseOutlines: [[CLLocationCoordinate2D]] = []
     @State private var courseFeatures: [OSMFeature] = []
     @State private var courseHoles: [OSMHole] = []
     /// Sub-courses of the displayed facility (empty for an ordinary single course);
@@ -185,10 +185,12 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             Map(position: $cameraPosition) {
-                if overlay.isVisible(.boundary), courseOutline.count >= 3 {
-                    MapPolygon(coordinates: courseOutline)
-                        .foregroundStyle(.gray.opacity(0.0))
-                        .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                if overlay.isVisible(.boundary) {
+                    ForEach(courseOutlines.indices, id: \.self) { i in
+                        MapPolygon(coordinates: courseOutlines[i])
+                            .foregroundStyle(.gray.opacity(0.0))
+                            .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                    }
                 }
                 ForEach(courseFeatures, id: \.osmIdentifier) { feature in
                     featureOverlay(feature)
@@ -226,7 +228,7 @@ struct ContentView: View {
         .onChange(of: selection) { _, newValue in
             guard let course = newValue?.course else { return }
             displayedCourse = course
-            courseOutline = []
+            courseOutlines = []
             courseFeatures = []
             courseHoles = []
             displayedSubCourses = []
@@ -339,6 +341,7 @@ struct ContentView: View {
     private var subCoursePicker: some View {
         if displayedSubCourses.count > 1 {
             Picker("Course", selection: $activeSubCourseID) {
+                Text("All").tag(String?.none)
                 ForEach(displayedSubCourses) { sub in
                     Text(subCourseLabel(sub)).tag(sub.id as String?)
                 }
@@ -414,10 +417,11 @@ struct ContentView: View {
         applyFeatures(from: osmCourse, for: course)
     }
 
-    /// Publishes the facility's sub-courses and picks a default active one (the
-    /// largest, listed first) when the displayed course is a multi-course facility.
-    /// Keeps a still-valid existing selection so a network refresh doesn't snap the
-    /// user back off a sub-course they switched to from the cached draw.
+    /// Publishes the facility's sub-courses and defaults the active selection to
+    /// "All" (`nil`) — the whole facility, so untagged features (a driving range,
+    /// the clubhouse area) stay visible and a multi-course park reads as one. Keeps a
+    /// still-valid existing selection so a network refresh doesn't snap the user back
+    /// off a sub-course they switched to from the cached draw.
     func applySubCourseState(from osmCourse: OSMCourse?, for course: GolfCourse) {
         guard displayedCourse?.identifier == course.identifier else { return }
         let subs = osmCourse?.subCourses ?? []
@@ -425,11 +429,11 @@ struct ContentView: View {
         if let active = activeSubCourseID, subs.contains(where: { $0.id == active }) {
             return
         }
-        activeSubCourseID = subs.first?.id
+        activeSubCourseID = nil
     }
 
     /// The currently active sub-course within `osmCourse`, or `nil` when none is
-    /// selected (an ordinary single course, or a facility shown in full).
+    /// selected — an ordinary single course, or a facility shown in full ("All").
     func activeSubCourse(in osmCourse: OSMCourse) -> OSMSubCourse? {
         guard let id = activeSubCourseID else { return nil }
         return osmCourse.subCourses.first { $0.id == id }
@@ -452,13 +456,24 @@ struct ContentView: View {
         return osmCourse.features.filter { ids.contains($0.osmIdentifier) }
     }
 
-    /// Assigns the boundary outline, ignoring stale results for a course that is no
-    /// longer the displayed one. Draws the active sub-course's own boundary when a
-    /// multi-course facility has one selected, otherwise the whole-course boundary.
+    /// Assigns the boundary outline(s), ignoring stale results for a course that is
+    /// no longer the displayed one.
+    ///  - Active sub-course → one outline: that sub-course's own boundary.
+    ///  - "All" on a facility → one outline per sub-course, so every course boundary
+    ///    is drawn simultaneously (e.g. both Balboa rings, all 5 Bethpage hulls).
+    ///  - Single course (no sub-courses) → one outline: the whole-course boundary.
     func applyOutline(from osmCourse: OSMCourse?, for course: GolfCourse) {
         guard displayedCourse?.identifier == course.identifier, let osmCourse else { return }
-        let boundary = activeSubCourse(in: osmCourse)?.boundary ?? osmCourse.boundary
-        courseOutline = boundary.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        func clCoords(_ ring: [Coordinate]) -> [CLLocationCoordinate2D] {
+            ring.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        }
+        if let sub = activeSubCourse(in: osmCourse) {
+            // A specific sub-course is selected: draw only its boundary.
+            courseOutlines = [clCoords(sub.boundary)]
+        } else {
+            // "All" or a single course: draw the facility's primary boundary ring.
+            courseOutlines = [clCoords(osmCourse.boundary)]
+        }
     }
 
     /// Assigns the course features, ignoring stale results for a course that is no
@@ -795,6 +810,23 @@ struct ContentView: View {
     @ViewBuilder
     func subCourseRows(for course: GolfCourse) -> some View {
         if isDisplayedFacility(course), displayedSubCourses.count > 1 {
+            Button {
+                activeSubCourseID = nil
+            } label: {
+                HStack {
+                    Label("All Courses", systemImage: "square.stack")
+                        .font(.subheadline)
+                        .lineLimit(1)
+                    Spacer()
+                    if activeSubCourseID == nil {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(.tint)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, 16)
             ForEach(displayedSubCourses) { sub in
                 Button {
                     activeSubCourseID = sub.id

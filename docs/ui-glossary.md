@@ -163,21 +163,24 @@ Indented child rows emitted by `subCourseRows(for:)` directly beneath the
 ```
 ┌─────────────────────────────────────────────┐
 │ Balboa Park Golf Course        ⭐           │  ← Course Row (facility)
-│   ⚑ Championship Course            ✓        │  ← Sub-Course Row (active)
+│   ▤ All Courses                   ✓        │  ← All-Courses Row (active)
+│   ⚑ Championship Course                     │  ← Sub-Course Row
 │   ⚑ Executive Course                        │  ← Sub-Course Row
 └─────────────────────────────────────────────┘
 ```
 
 | Element | Canonical name | Icon / Source | Notes |
 | --- | --- | --- | --- |
+| Indented "All Courses" button | **All-Courses Row** | `square.stack`, `subCourseRows(for:)` in [ContentView.swift](../caddie/ContentView.swift) | Listed first; sets `activeSubCourseID` to `nil` to show the whole facility (every hole/feature, including untagged ones like a driving range) |
 | Indented sub-course button | **Sub-Course Row** | `flag`, `subCourseRows(for:)` in [ContentView.swift](../caddie/ContentView.swift) | One per `displayedSubCourses` entry; sets `activeSubCourseID` |
-| Trailing check on the active row | **Sub-Course Checkmark** | `checkmark`, [ContentView.swift](../caddie/ContentView.swift) | Tint-colored; marks the active sub-course |
+| Trailing check on the active row | **Sub-Course Checkmark** | `checkmark`, [ContentView.swift](../caddie/ContentView.swift) | Tint-colored; marks the active row (the **All-Courses Row** when no sub-course is selected) |
 
 > **Sub-Course Rows** appear only beneath the **displayed facility** and only
-> when it has more than one sub-course. They are buttons, not `List` selections —
-> the `List` selection stays on the facility while the active sub-course is shown
-> here and in the **Sub-Course Picker**, which stay in sync. An ordinary single
-> course shows no **Sub-Course Rows**.
+> when it has more than one sub-course, always led by the **All-Courses Row**.
+> They are buttons, not `List` selections — the `List` selection stays on the
+> facility while the active sub-course is shown here and in the **Sub-Course
+> Picker**, which stay in sync. A facility opens on **All Courses** by default. An
+> ordinary single course shows no **Sub-Course Rows**.
 
 ---
 
@@ -234,21 +237,23 @@ the `subCoursePicker` view, for facilities that contain more than one course
 (e.g. Balboa Park's Championship and Executive courses).
 
 ```
-              ┌───────────────────────────────┐
-              │  Championship  │   Executive   │  ← Sub-Course Picker
-              └───────────────────────────────┘
+              ┌──────────────────────────────────────────┐
+              │  All  │  Championship  │   Executive   │  ← Sub-Course Picker
+              └──────────────────────────────────────────┘
 ```
 
 | Element | Canonical name | Source | Notes |
 | --- | --- | --- | --- |
 | Segmented course switcher | **Sub-Course Picker** | `subCoursePicker` in [ContentView.swift](../caddie/ContentView.swift) | `.pickerStyle(.segmented)` in a `.regularMaterial` capsule; bound to `activeSubCourseID` |
+| Leading "All" segment | **All Segment** | [ContentView.swift](../caddie/ContentView.swift) | Tagged `nil`; the default, draws the whole facility (every hole/feature) so a multi-course park reads as one |
 | One segment per sub-course | **Sub-Course Segment** | [ContentView.swift](../caddie/ContentView.swift) | Label is the sub-course name with a trailing "Course"/"Golf Course" trimmed |
 
-> The **Sub-Course Picker** is hidden unless `displayedSubCourses.count > 1`. It
-> mirrors the **Sub-Course Rows** in the sidebar ([§2.4](#24-sub-course-rows)) —
-> both read and write `activeSubCourseID`, so switching from either updates the
-> other and re-filters the **Map Overlay Layers** to the active sub-course's own
-> boundary and the holes/features that fall inside it.
+> The **Sub-Course Picker** is hidden unless `displayedSubCourses.count > 1`, and
+> opens on the **All Segment**. It mirrors the **Sub-Course Rows** in the sidebar
+> ([§2.4](#24-sub-course-rows)) — both read and write `activeSubCourseID`, so
+> switching from either updates the other and re-filters the **Map Overlay
+> Layers**: a sub-course segment shows its own boundary and the holes/features
+> that fall inside it, while **All** shows the facility boundary and everything.
 
 ---
 

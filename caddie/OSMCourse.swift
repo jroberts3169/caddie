@@ -280,7 +280,12 @@ nonisolated enum OSMCourseBuilder {
         waysByID: [Int64: OverpassWay],
         nodesByID: [Int64: OverpassNode]
     ) -> [OSMSubCourse] {
-        if let tagged = tagBasedSubCourses(holes: holes, features: features) {
+        // Exclude the primary so a facility ring (e.g. "Augusta National Golf Club")
+        // can't substitute itself as the boundary of the same-named sub-course group.
+        let nonPrimary = candidates.filter {
+            !($0.osmType == primary.osmType && $0.id == primary.id)
+        }
+        if let tagged = tagBasedSubCourses(holes: holes, features: features, candidates: nonPrimary) {
             return tagged
         }
         return polygonSubCourses(
@@ -291,31 +296,47 @@ nonisolated enum OSMCourseBuilder {
 
     /// Tier 1: group holes by `golf:course:name`. Returns `nil` (not `[]`) when fewer
     /// than two distinct course names are present, so the caller falls through to the
-    /// polygon tier.
-    private static func tagBasedSubCourses(holes: [OSMHole], features: [OSMFeature]) -> [OSMSubCourse]? {
+    /// polygon tier. `candidates` are the non-primary `leisure=golf_course` boundaries
+    /// in the response; when a candidate's name matches a group name it is used as the
+    /// sub-course boundary in place of the synthesized convex hull (real polygon wins).
+    private static func tagBasedSubCourses(
+        holes: [OSMHole],
+        features: [OSMFeature],
+        candidates: [CourseBoundary]
+    ) -> [OSMSubCourse]? {
         let grouped = Dictionary(grouping: holes.compactMap { hole -> (String, OSMHole)? in
             guard let course = hole.tags["golf:course:name"] else { return nil }
             return (course, hole)
         }, by: { $0.0 }).mapValues { $0.map(\.1) }
         guard grouped.count >= 2 else { return nil }
 
-        // A convex hull (lightly buffered) per course, built from every coordinate of
-        // its holes so the tee→green corridors are enclosed.
-        let hulls = grouped.mapValues { holes -> [Coordinate] in
+        // Convex hull per group (always computed — used for feature attribution even
+        // when a real polygon replaces it as the display boundary, because the hull
+        // is tighter around its own holes and gives cleaner attribution).
+        let hulls: [String: [Coordinate]] = grouped.mapValues { holes in
             GolfGeometry.buffered(GolfGeometry.convexHull(holes.flatMap(\.coordinates)), by: 0.08)
+        }
+
+        // Display boundary: prefer a real mapped polygon whose name matches the group.
+        // Attribution boundary: always the hull (tighter, avoids misattributing features
+        // between overlapping hull and polygon boundary at the edges).
+        let displayBoundaries: [String: [Coordinate]] = grouped.keys.reduce(into: [:]) { dict, name in
+            if let polygon = candidates.first(where: { nameMatches($0.name, name) }),
+               !polygon.boundary.isEmpty {
+                dict[name] = polygon.boundary
+            } else {
+                dict[name] = hulls[name] ?? []
+            }
         }
 
         return grouped
             .map { name, holes -> OSMSubCourse in
-                // Untagged features fall to the SMALLEST hull that contains them, so a
-                // feature inside a compact course nested in a larger one (Augusta's
-                // Par 3 inside the main 18's hull) is attributed to the inner course.
                 let featureIDs = features.filter { feature in
                     guard let center = GolfGeometry.centroid(of: feature.coordinates) else { return false }
                     return smallestContainer(of: center, in: hulls) == name
                 }.map(\.osmIdentifier)
                 return OSMSubCourse(
-                    id: "tag-\(name)", name: name, boundary: hulls[name] ?? [],
+                    id: "tag-\(name)", name: name, boundary: displayBoundaries[name] ?? [],
                     holeIDs: holes.map(\.osmIdentifier), featureIDs: featureIDs
                 )
             }

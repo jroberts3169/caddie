@@ -70,3 +70,20 @@ prefer the boundary whose simplified name matches, area only as a tie-break, fal
 back to largest when nothing matches (OSM names are loose). Note the looseApple
 match can let two names both match (" "augusta  the areanational") augusta" 
 tie-break must still pick the right one.
+
+### Bethpage confirms Tier 1, and why "All" must exist
+
+Checked Bethpage State Park live before coding: it is ONE `leisure=golf_course`
+way ("Bethpage State Park Golf Courses") containing 90 holes, each tagged
+`golf:course:name` = Black/Red/Green/Blue/Yellow (18 apiece).  like Augusta So 
+it is **Tier 1 (tag-grouped)**, NOT five boundary polygons. No new detection was
+needed; the existing tag tier already splits it into five hull sub-courses.
+
+Filtering to one sub-course hides everything not attributed to  a facility'sit 
+driving range, clubhouse, and other untagged features vanish, and you can no longer
+see a multi-course park as a whole. Fix: an **"All" selection** (`activeSubCourseID
+== nil`) that renders the full facility boundary + every hole/feature. Make it the
+DEFAULT so a facility opens whole; drilling into a course is opt-in. Render already
+fell back to the full course for `nil` active, so "All" was purely a UI/default add
+(an "All" picker segment tagged `nil` + an "All Courses" sidebar  no model orrow) 
+builder change.
