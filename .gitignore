@@ -1,6 +1,7 @@
-*.xcworkspace
-*.xcodeproj
+## Xcode per-user files
+xcuserdata/
 *.xcuserstate
+
 build
 .derived
 profiles
