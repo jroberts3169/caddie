@@ -17,6 +17,7 @@ struct GolfCourse: Codable, Identifiable, Hashable {
     let name: String
     let address: String
     let city: String
+    let state: String
     let country: String
     let countryCode: String
     let phone: String
@@ -35,6 +36,7 @@ final class RecentCourse {
     var name: String
     var address: String
     var city: String
+    var state: String = ""
     var country: String
     var countryCode: String
     var phone: String
@@ -48,6 +50,7 @@ final class RecentCourse {
         self.name = course.name
         self.address = course.address
         self.city = course.city
+        self.state = course.state
         self.country = course.country
         self.countryCode = course.countryCode
         self.phone = course.phone
@@ -63,6 +66,7 @@ final class RecentCourse {
             name: name,
             address: address,
             city: city,
+            state: state,
             country: country,
             countryCode: countryCode,
             phone: phone,
@@ -79,6 +83,7 @@ final class FavoriteCourse {
     var name: String
     var address: String
     var city: String
+    var state: String = ""
     var country: String
     var countryCode: String
     var phone: String
@@ -92,6 +97,7 @@ final class FavoriteCourse {
         self.name = course.name
         self.address = course.address
         self.city = course.city
+        self.state = course.state
         self.country = course.country
         self.countryCode = course.countryCode
         self.phone = course.phone
@@ -107,6 +113,7 @@ final class FavoriteCourse {
             name: name,
             address: address,
             city: city,
+            state: state,
             country: country,
             countryCode: countryCode,
             phone: phone,
@@ -200,7 +207,8 @@ struct ContentView: View {
         } detail: {
             courseMap
         }
-        .navigationTitle("Caddie")
+        .navigationTitle(displayedCourse?.name ?? "Caddie")
+        .navigationSubtitle(displayedCourse.map { locationSubtitle(for: $0) ?? "" } ?? "")
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
         .onChange(of: searchText) { _, newValue in
             if newValue.isEmpty {
@@ -761,11 +769,22 @@ struct ContentView: View {
         let results = response.mapItems.map { item in
             let representations = item.addressRepresentations
             let coordinate = item.location.coordinate
+            let cityName = representations?.cityName ?? ""
+            // `cityWithContext(.short)` yields e.g. "Pebble Beach, CA"; peel off the
+            // leading city to isolate the state/region for separate display.
+            let cityContext = representations?.cityWithContext(.short) ?? ""
+            let state: String
+            if !cityName.isEmpty, cityContext.hasPrefix(cityName + ", ") {
+                state = String(cityContext.dropFirst(cityName.count + 2))
+            } else {
+                state = ""
+            }
             return GolfCourse(
                 identifier: item.url?.absoluteString ?? UUID().uuidString,
                 name: item.name ?? "Unknown",
                 address: item.address?.shortAddress ?? item.address?.fullAddress ?? "",
-                city: representations?.cityName ?? "",
+                city: cityName,
+                state: state,
                 country: representations?.regionName ?? "",
                 countryCode: representations?.region?.identifier ?? "",
                 phone: item.phoneNumber ?? "",
@@ -811,13 +830,21 @@ struct ContentView: View {
             if !searchResults.isEmpty {
                 Section("Results") {
                     ForEach(searchResults) { course in
-                        courseRow(course: course, subtitle: course.city.isEmpty ? nil : course.city)
+                        courseRow(course: course, subtitle: locationSubtitle(for: course))
                             .tag(SidebarSelection.result(course))
                         subCourseRows(for: course)
                     }
                 }
             }
         }
+    }
+
+    /// "City, State" for the Results subtitle, gracefully omitting whichever part
+    /// MapKit didn't supply. Returns `nil` when neither is known so the row falls
+    /// back to its single-line title layout.
+    func locationSubtitle(for course: GolfCourse) -> String? {
+        let parts = [course.city, course.state].filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 
     @ViewBuilder
