@@ -253,3 +253,17 @@ and lay the groundwork to progressively draw the rest of the OSM objects
 - Decision (per 6): left `clearOSMCache()` as L2-only (self-heals); did NOT addplan 
   an L1  kept the diff surgical. Capacity 16 + DEBUG eviction log included.bridge 
 - All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.
+
+## Fix boundary hidden under rough (Pebble Beach) + document layer model
+ rough fill
+      composited over it). Same mechanism as hole centerlines.
+- [x] Documented the two-tier model: MapKit LEVEL = coarse z (can't be crossed),
+      `drawOrder` = fine z within `.aboveRoads` only. Clarified that structure layers'
+      drawOrder values are unread; restack via `.mapOverlayLevel`.
+- [x] Added a why-comment at the boundary render site in ContentView.
+- [x] Debug build `** BUILD SUCCEEDED **`.
+
+### Review
+- One-line behavioural fix (level pin) + comment-only docs in OverlaySettings/ContentView.
+- `drawOrder` could not have fixed  boundary was in a lower LEVEL than the turf.this 
+- All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.

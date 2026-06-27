@@ -155,7 +155,7 @@ struct ContentView: View {
     @Environment(\.osmFetcher) private var osmFetcher
     @Environment(OverlaySettings.self) private var overlay
     @Query(sort: \RecentCourse.lastVisited, order: .reverse) private var recents: [RecentCourse]
-    @Query(sort: \FavoriteCourse.dateFavorited, order: .reverse) private var favorites: [FavoriteCourse]
+    @Query(sort: \FavoriteCourse.name, order: .forward) private var favorites: [FavoriteCourse]
     @State private var searchText: String = ""
     @State private var searchResults: [GolfCourse] = []
     @State private var selection: SidebarSelection?
@@ -193,11 +193,15 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             Map(position: $cameraPosition) {
+                // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
+                // the outline draws above the translucent turf fills at `.aboveRoads`
+                // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
                 if overlay.isVisible(.boundary) {
                     ForEach(courseOutlines.indices, id: \.self) { i in
                         MapPolygon(coordinates: courseOutlines[i])
                             .foregroundStyle(.gray.opacity(0.0))
                             .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                            .mapOverlayLevel(level: .aboveLabels)
                     }
                 }
                 ForEach(courseFeatures, id: \.osmIdentifier) { feature in
@@ -755,6 +759,7 @@ struct ContentView: View {
                         courseRow(course: course, subtitle: nil)
                             .tag(SidebarSelection.favorite(course))
                         subCourseRows(for: course)
+                        
                     }
                 }
             }

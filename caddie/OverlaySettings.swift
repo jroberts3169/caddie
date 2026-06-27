@@ -74,8 +74,14 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
     /// composite on top. Tuned so the visible stack reads, top to bottom:
     /// hole line ▸ greens ▸ fairways ▸ rough — the broad turf areas sit at the
     /// back, with the smaller detail features (tees, bunkers, water, cart paths)
-    /// layered on top of the turf they sit within. The hole centerlines render
-    /// at `.aboveLabels`, so they always stay above every feature here.
+    /// layered on top of the turf they sit within.
+    ///
+    /// This only sequences features WITHIN the `.aboveRoads` pass. The coarse z-axis
+    /// is the MapKit overlay LEVEL, not this value: structure layers (boundary, holes)
+    /// render in their own passes pinned to `.aboveLabels`, so they always sit above
+    /// every feature here regardless of `drawOrder`. `drawOrder` can never cross
+    /// levels — to change where the boundary or holes stack, set their
+    /// `.mapOverlayLevel` in `ContentView`, NOT these numbers.
     var drawOrder: Int {
         switch self {
         case .rough: return 0
@@ -87,8 +93,9 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
         case .water: return 6
         case .path: return 7
         case .unknown: return 8
-        // Structure layers render in their own passes, not the feature loop,
-        // so these only matter if the value is ever read for them.
+        // Structure layers are pinned to `.aboveLabels` and never flow through the
+        // sorted feature loop, so these values are unread — they exist only to keep
+        // the switch exhaustive. Boundary/holes z-order is set by their map level.
         case .boundary: return -1
         case .holes: return 99
         }
