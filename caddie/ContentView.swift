@@ -186,45 +186,15 @@ struct ContentView: View {
     /// the same course JOIN the same task and both apply its result, instead of the
     /// second caller racing the first (and going blank if the first is cancelled).
     @State private var inFlightFetches: [String: Task<OSMCourse?, Error>] = [:]
+
+    private let cameraBounds = MapCameraBounds(minimumDistance: 300, maximumDistance: 8000)
     
     var body: some View {
         NavigationSplitView {
           courseSidebar
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
-            Map(position: $cameraPosition) {
-                // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
-                // the outline draws above the translucent turf fills at `.aboveRoads`
-                // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
-                if overlay.isVisible(.boundary) {
-                    ForEach(courseOutlines.indices, id: \.self) { i in
-                        MapPolygon(coordinates: courseOutlines[i])
-                            .foregroundStyle(.gray.opacity(0.0))
-                            .stroke(overlay.color(for: .boundary), lineWidth: 3)
-                            .mapOverlayLevel(level: .aboveLabels)
-                    }
-                }
-                ForEach(courseFeatures, id: \.osmIdentifier) { feature in
-                    featureOverlay(feature)
-                }
-                // Drawn last so the dashed hole centerlines sit on top of the
-                // fairway/green fills rather than being composited under them.
-                if overlay.isVisible(.holes) {
-                    ForEach(courseHoles, id: \.osmIdentifier) { hole in
-                        holeOverlay(hole)
-                    }
-                }
-                if let displayedCourse {
-                    Marker(displayedCourse.name, coordinate: displayedCourse.coordinate)
-                }
-            }
-            .mapStyle(MapStyle.imagery(elevation: .realistic))
-            .overlay(alignment: .center) {
-                loadingBanner
-            }
-            .overlay(alignment: .bottom) {
-                subCoursePicker
-            }
+            courseMap
         }
         .navigationTitle("Caddie")
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
@@ -273,6 +243,42 @@ struct ContentView: View {
             guard let course = displayedCourse, let osmCourse = osmCache[course.identifier] else { return }
             applyOutline(from: osmCourse, for: course)
             applyFeatures(from: osmCourse, for: course)
+        }
+    }
+
+    private var courseMap: some View {
+        Map(position: $cameraPosition, bounds: cameraBounds) {
+            // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
+            // the outline draws above the translucent turf fills at `.aboveRoads`
+            // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
+            if overlay.isVisible(.boundary) {
+                ForEach(courseOutlines.indices, id: \.self) { i in
+                    MapPolygon(coordinates: courseOutlines[i])
+                        .foregroundStyle(.gray.opacity(0.0))
+                        .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                        .mapOverlayLevel(level: .aboveLabels)
+                }
+            }
+            ForEach(courseFeatures, id: \.osmIdentifier) { feature in
+                featureOverlay(feature)
+            }
+            // Drawn last so the dashed hole centerlines sit on top of the
+            // fairway/green fills rather than being composited under them.
+            if overlay.isVisible(.holes) {
+                ForEach(courseHoles, id: \.osmIdentifier) { hole in
+                    holeOverlay(hole)
+                }
+            }
+            if let displayedCourse {
+                Marker(displayedCourse.name, coordinate: displayedCourse.coordinate)
+            }
+        }
+        .mapStyle(MapStyle.imagery(elevation: .realistic))
+        .overlay(alignment: .center) {
+            loadingBanner
+        }
+        .overlay(alignment: .bottom) {
+            subCoursePicker
         }
     }
 
