@@ -87,3 +87,65 @@ DEFAULT so a facility opens whole; drilling into a course is opt-in. Render alre
 fell back to the full course for `nil` active, so "All" was purely a UI/default add
 (an "All" picker segment tagged `nil` + an "All Courses" sidebar  no model orrow) 
 builder change.
+
+### Multipolygon courses need MULTI-RING boundaries (TPC Sawgrass)
+
+TPC Sawgrass is a FOURTH topology: `relation 1783123`, `type=multipolygon`, ~60
+outer ways that assemble into **4 disjoint closed rings** (the course is split
+across several parcels), and the holes carry NO `golf:course:name` tag. The old
+`stitchRing` built ONE ring and stopped when no segment touched its endpoints,
+silently dropping the other 3 rings (28  so 9/36 holes fell outside thesegments) 
+drawn boundary.
+
+Fixes / rules:
+- A course boundary is `[[Coordinate]]` (rings), not `[Coordinate]`. `OSMCourse`
+  and `OSMSubCourse` both store rings; render flattens to one `MapPolyline` per ring.
+- `assembleRings` extends a ring from EITHER endpoint but **stops as soon as the
+  ring closes** (`first == last`), then peels the next ring from the leftovers.
+  Never keep extending across a closure or you merge disjoint loops into garbage.
+- Inside-test across disjoint rings uses the **even-odd rule** (`isInside(_,rings:)`
+ in;
+ out. Correct for BOTH disjoint outers and holes.
+- Disjoint-centroid gotcha: the area-weighted centroid of disjoint rings can land
+  in the GAP between parcels (outside all of them). For the spatial sub-course
+  containment test use `centroid(ofRings:)` = centroid of the LARGEST ring, which
+  is guaranteed inside.
+- Changing `boundary`'s on-disk shape breaks cached SwiftData rows. Use a TOLERANT
+  decoder: try `[[Coordinate]]`, fall back to legacy `[Coordinate]` wrapped as one
+ `[]` so a single bad field
+  can't strand the whole row (blank map within the cache TTL).
+- Keep `stitchRing` for multipolygon FEATURE stitching (fairways/ thosegreens) 
+  are single loops; only the COURSE boundary needed the multi-ring assembler.
+- Verified live: TPC = 4 rings, 0/36 outside; Bethpage/Augusta still Tier-1,
+  Coronado single, Balboa still Tier-2 (its 9 executive holes sit outside the
+  championship primary by  they're a separate sub-course polygon, not adesign 
+  regression).
+
+### Tier  split a course by hole-NAME prefix (TPC Sawgrass two courses)1b 
+
+TPC Sawgrass is a FIFTH topology. It really holds two 18-hole  THE PLAYERScourses 
+Stadium Course and Dye's Valley  but the holes carry NO `golf:course:name`Course 
+tag (so Tier 1 misses them) and there are NO per-course mapped polygons (so Tier 2
+misses them). The only signal is the hole `name`: "Stadium "Stadium 18" and1"
+"Valley "Valley 18". So the app showed one course.1"
+
+Fix: add **Tier  group holes by the `name` PREFIX (the name with its trailing1b** 
+hole number stripped; strip the `ref` when the name ends with it, else trailing
+ sub-courses, with convex-hull
+boundaries exactly like the tag tier (real polygon preferred when a candidate name
+matches; hull used for feature attribution).
+
+ single**. Real mapped polygons
+(Tier 2) must win over synthesized hulls, so hole-name only runs after the polygon
+tier returns empty. Guard: skip Tier 1b entirely if ANY hole has `golf:course:name`
+(that's Tier 1's job). Verified live via the app's `map_to_area` query:
+ Stadium 18 + Valley 18 (the East/West/South holes belong to the
+  neighbouring Sawgrass Country Club and The Yards; `map_to_area` scopes them out,
+  so only 36 holes reach the  clean 2-way split).builder 
+ no split; Balboa still Tier 2.
+ Tier 1b skipped).
+
+Gotcha to remember: name-prefix can't tell "two separate 18-hole courses" from
+"front/back nine of ONE course" by names alone. We accept that risk because OSM
+convention puts genuinely separate courses behind distinct relations/tags; lone
+name prefixes are the last-resort signal. Group case-insensitively ("West"/"west").

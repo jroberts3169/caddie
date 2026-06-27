@@ -17,14 +17,16 @@ nonisolated struct Coordinate: Codable, Hashable {
 ///  - a `golf:course:name` group of holes inside one shared ring (Augusta's
 ///    "Augusta National" 18 + "Par 3 Course" 9), whose `boundary` is a convex hull
 ///    synthesized from those holes.
-/// Attribution is resolved once at build time: `holeIDs`/`featureIDs` reference the
-/// owning `OSMCourse`'s top-level `holes`/`features` by `osmIdentifier`.
+/// `boundary` is a list of rings (a polygon may be several disjoint pieces — see
+/// `OSMCourse.boundary`). Attribution is resolved once at build time:
+/// `holeIDs`/`featureIDs` reference the owning `OSMCourse`'s top-level
+/// `holes`/`features` by `osmIdentifier`.
 nonisolated struct OSMSubCourse: Codable, Hashable, Identifiable {
     /// Stable identity: "way-123" / "relation-123" for polygon courses, or
     /// "tag-<golf:course:name>" for tag-grouped courses.
     let id: String
     let name: String?
-    let boundary: [Coordinate]
+    let boundary: [[Coordinate]]
     let holeIDs: [Int64]
     let featureIDs: [Int64]
 }
@@ -34,7 +36,11 @@ nonisolated struct OSMCourse: Codable, Hashable {
     let osmType: String
     let name: String?
     let tags: [String: String]
-    let boundary: [Coordinate]
+    /// The course outline as a list of rings. Most courses are a single ring, but a
+    /// `type=multipolygon` course (e.g. TPC Sawgrass) is several disjoint outer rings
+    /// — the parcels the course occupies, split by water/roads/housing. Storing every
+    /// ring is what keeps holes in outlying parcels inside the drawn boundary.
+    let boundary: [[Coordinate]]
     let holes: [OSMHole]
     let features: [OSMFeature]
     /// Sub-courses of a multi-course facility, largest first. Empty for an ordinary
@@ -46,7 +52,7 @@ nonisolated struct OSMCourse: Codable, Hashable {
         osmType: String,
         name: String?,
         tags: [String: String],
-        boundary: [Coordinate],
+        boundary: [[Coordinate]],
         holes: [OSMHole],
         features: [OSMFeature],
         subCourses: [OSMSubCourse] = []
@@ -61,19 +67,26 @@ nonisolated struct OSMCourse: Codable, Hashable {
         self.subCourses = subCourses
     }
 
-    // Custom decoder so cache rows written before `subCourses` existed still decode
-    // (a hard-required key would make every legacy row fail to decode, and because
-    // the SwiftData row stays "ok" within its TTL that would strand the map blank).
+    // Custom decoder so cache rows written before a shape change still decode (a hard
+    // decode failure would strand the map blank within the row's TTL). `boundary`
+    // also accepts the legacy single-ring `[Coordinate]` shape and wraps it, and
+    // `subCourses` falls back to [] if its (newer, more volatile) shape mismatches.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         osmIdentifier = try c.decode(Int64.self, forKey: .osmIdentifier)
         osmType = try c.decode(String.self, forKey: .osmType)
         name = try c.decodeIfPresent(String.self, forKey: .name)
         tags = try c.decode([String: String].self, forKey: .tags)
-        boundary = try c.decode([Coordinate].self, forKey: .boundary)
+        if let rings = try? c.decode([[Coordinate]].self, forKey: .boundary) {
+            boundary = rings
+        } else if let ring = try? c.decode([Coordinate].self, forKey: .boundary) {
+            boundary = ring.isEmpty ? [] : [ring]
+        } else {
+            boundary = []
+        }
         holes = try c.decode([OSMHole].self, forKey: .holes)
         features = try c.decode([OSMFeature].self, forKey: .features)
-        subCourses = try c.decodeIfPresent([OSMSubCourse].self, forKey: .subCourses) ?? []
+        subCourses = (try? c.decode([OSMSubCourse].self, forKey: .subCourses)) ?? []
     }
 }
 
@@ -217,8 +230,8 @@ nonisolated enum OSMCourseBuilder {
         let nameMatched = candidates.filter { nameMatches($0.name, searchName) }
         let pool = nameMatched.isEmpty ? candidates : nameMatched
         guard let primary = pool.max(by: { lhs, rhs in
-            let lhsArea = GolfGeometry.ringArea(lhs.boundary)
-            let rhsArea = GolfGeometry.ringArea(rhs.boundary)
+            let lhsArea = GolfGeometry.polygonArea(lhs.boundary)
+            let rhsArea = GolfGeometry.polygonArea(rhs.boundary)
             if lhsArea != rhsArea { return lhsArea < rhsArea }
             // Equal area (a multipolygon facility shares its outer ring with a member
             // way): the relation is the facility wrapper, so let it win the tie.
@@ -269,7 +282,12 @@ nonisolated enum OSMCourseBuilder {
     ///  - Tier 2 — child `leisure=golf_course` boundary polygons (Balboa: relation
     ///    members or spatially enclosed). Holes/features attributed by the smallest
     ///    containing polygon.
-    /// Tier 1 wins when it yields two or more courses (the tag is authoritative).
+    ///  - Tier 1b — holes carrying no `golf:course:name` tag but whose `name` encodes
+    ///    the course as a prefix (TPC Sawgrass: "Stadium 1"… + "Valley 1"…). Group by
+    ///    that prefix; boundary is a convex hull of each group's holes, like Tier 1.
+    /// Real mapped polygons (Tier 2) are preferred over the synthesized hulls of the
+    /// tag/name tiers, so the cascade tries tag → polygon → hole-name. Tier 1 wins
+    /// outright when its tag yields two or more courses (the tag is authoritative).
     /// Returns `[]` for an ordinary single course, preserving current behaviour.
     private static func makeSubCourses(
         primary: CourseBoundary,
@@ -288,10 +306,14 @@ nonisolated enum OSMCourseBuilder {
         if let tagged = tagBasedSubCourses(holes: holes, features: features, candidates: nonPrimary) {
             return tagged
         }
-        return polygonSubCourses(
+        let polygons = polygonSubCourses(
             primary: primary, candidates: candidates, holes: holes, features: features,
             relationsByID: relationsByID, waysByID: waysByID, nodesByID: nodesByID
         )
+        if !polygons.isEmpty {
+            return polygons
+        }
+        return holeNameSubCourses(holes: holes, features: features, candidates: nonPrimary) ?? []
     }
 
     /// Tier 1: group holes by `golf:course:name`. Returns `nil` (not `[]`) when fewer
@@ -312,17 +334,18 @@ nonisolated enum OSMCourseBuilder {
 
         // Convex hull per group (always computed — used for feature attribution even
         // when a real polygon replaces it as the display boundary, because the hull
-        // is tighter around its own holes and gives cleaner attribution).
-        let hulls: [String: [Coordinate]] = grouped.mapValues { holes in
-            GolfGeometry.buffered(GolfGeometry.convexHull(holes.flatMap(\.coordinates)), by: 0.08)
+        // is tighter around its own holes and gives cleaner attribution). One ring,
+        // wrapped as a single-ring polygon.
+        let hulls: [String: [[Coordinate]]] = grouped.mapValues { holes in
+            [GolfGeometry.buffered(GolfGeometry.convexHull(holes.flatMap(\.coordinates)), by: 0.08)]
         }
 
         // Display boundary: prefer a real mapped polygon whose name matches the group.
         // Attribution boundary: always the hull (tighter, avoids misattributing features
         // between overlapping hull and polygon boundary at the edges).
-        let displayBoundaries: [String: [Coordinate]] = grouped.keys.reduce(into: [:]) { dict, name in
+        let displayBoundaries: [String: [[Coordinate]]] = grouped.keys.reduce(into: [:]) { dict, name in
             if let polygon = candidates.first(where: { nameMatches($0.name, name) }),
-               !polygon.boundary.isEmpty {
+               polygon.boundary.contains(where: { $0.count >= 3 }) {
                 dict[name] = polygon.boundary
             } else {
                 dict[name] = hulls[name] ?? []
@@ -343,6 +366,84 @@ nonisolated enum OSMCourseBuilder {
             .sorted { $0.holeIDs.count > $1.holeIDs.count }
     }
 
+    /// Tier 1b: split a course whose holes are NOT tagged `golf:course:name` but whose
+    /// `name` encodes the course as a prefix — TPC Sawgrass names its 36 holes
+    /// "Stadium 1"…"Stadium 18" (THE PLAYERS Stadium Course) and "Valley 1"…"Valley 18"
+    /// (Dye's Valley Course). Group by the prefix (the name with its trailing hole
+    /// number removed); each group of three or more holes is a sub-course whose boundary
+    /// is a convex hull of its holes (a real mapped polygon replaces it when a candidate
+    /// name matches), and whose untagged features are attributed by the smallest
+    /// containing hull. Returns `nil` (not `[]`) when fewer than two plausible prefix
+    /// groups exist, so an ordinary single course is kept whole. Skipped entirely once
+    /// any hole carries `golf:course:name` — that is Tier 1's job.
+    private static func holeNameSubCourses(
+        holes: [OSMHole],
+        features: [OSMFeature],
+        candidates: [CourseBoundary]
+    ) -> [OSMSubCourse]? {
+        guard !holes.contains(where: { $0.tags["golf:course:name"] != nil }) else { return nil }
+
+        // Group case-insensitively so "West"/"west" coalesce; keep the first hole's
+        // original casing for display. Drop groups of fewer than three holes so a stray
+        // "Practice 1" can't peel off as a course.
+        let grouped = Dictionary(grouping: holes.compactMap { hole -> (String, OSMHole)? in
+            guard let prefix = courseNamePrefix(of: hole) else { return nil }
+            return (prefix.lowercased(), hole)
+        }, by: { $0.0 }).mapValues { $0.map(\.1) }
+        let plausible = grouped.filter { $0.value.count >= 3 }
+        guard plausible.count >= 2 else { return nil }
+
+        let names: [String: String] = plausible.reduce(into: [:]) { dict, entry in
+            dict[entry.key] = entry.value.lazy.compactMap { courseNamePrefix(of: $0) }.first ?? entry.key
+        }
+
+        // Convex hull per group — used for feature attribution even when a real polygon
+        // replaces it as the display boundary (the hull is tighter around its own holes).
+        let hulls: [String: [[Coordinate]]] = plausible.mapValues { holes in
+            [GolfGeometry.buffered(GolfGeometry.convexHull(holes.flatMap(\.coordinates)), by: 0.08)]
+        }
+
+        let displayBoundaries: [String: [[Coordinate]]] = plausible.keys.reduce(into: [:]) { dict, key in
+            if let polygon = candidates.first(where: { nameMatches($0.name, names[key]) }),
+               polygon.boundary.contains(where: { $0.count >= 3 }) {
+                dict[key] = polygon.boundary
+            } else {
+                dict[key] = hulls[key] ?? []
+            }
+        }
+
+        return plausible
+            .map { key, holes -> OSMSubCourse in
+                let featureIDs = features.filter { feature in
+                    guard let center = GolfGeometry.centroid(of: feature.coordinates) else { return false }
+                    return smallestContainer(of: center, in: hulls) == key
+                }.map(\.osmIdentifier)
+                return OSMSubCourse(
+                    id: "holename-\(key)", name: names[key] ?? key,
+                    boundary: displayBoundaries[key] ?? [],
+                    holeIDs: holes.map(\.osmIdentifier), featureIDs: featureIDs
+                )
+            }
+            .sorted { $0.holeIDs.count > $1.holeIDs.count }
+    }
+
+    /// The course label carried in a hole's `name`: the name with its trailing hole
+    /// number stripped ("Stadium 1" → "Stadium", "Valley 18" → "Valley"). Strips the
+    /// `ref` when the name ends with it, otherwise trailing digits. Returns `nil` when
+    /// the name is absent or numeric only ("7" → nil), so number-only holes never split.
+    private static func courseNamePrefix(of hole: OSMHole) -> String? {
+        guard var base = hole.tags["name"]?.trimmingCharacters(in: .whitespaces), !base.isEmpty else {
+            return nil
+        }
+        if let ref = hole.ref, !ref.isEmpty, base.lowercased().hasSuffix(ref.lowercased()) {
+            base = String(base.dropLast(ref.count))
+        } else {
+            while let last = base.last, last.isNumber { base = String(base.dropLast()) }
+        }
+        base = base.trimmingCharacters(in: CharacterSet(charactersIn: " -#."))
+        return base.isEmpty ? nil : base
+    }
+
     /// Tier 2: child course boundary polygons (relation members + spatially enclosed),
     /// with holes/features attributed by the smallest containing polygon.
     private static func polygonSubCourses(
@@ -357,7 +458,7 @@ nonisolated enum OSMCourseBuilder {
         var collected: [CourseBoundary] = []
         var seen = Set<String>()
         func add(_ candidate: CourseBoundary) {
-            guard candidate.boundary.count >= 3,
+            guard candidate.boundary.contains(where: { $0.count >= 3 }),
                   !(candidate.osmType == primary.osmType && candidate.id == primary.id) else { return }
             if seen.insert("\(candidate.osmType)/\(candidate.id)").inserted {
                 collected.append(candidate)
@@ -370,20 +471,20 @@ nonisolated enum OSMCourseBuilder {
                 guard let way = waysByID[member.ref], isCourseBoundary(way.tags) else { continue }
                 add(CourseBoundary(
                     id: way.id, osmType: "way", name: way.tags?["name"],
-                    tags: way.tags ?? [:], boundary: coordinates(for: way, nodesByID: nodesByID)
+                    tags: way.tags ?? [:], boundary: [coordinates(for: way, nodesByID: nodesByID)]
                 ))
             }
         }
 
         // 2. Other valid course boundaries enclosed by the facility polygon.
         for candidate in candidates {
-            guard let center = GolfGeometry.centroid(of: candidate.boundary),
-                  GolfGeometry.isInside(center, polygon: primary.boundary) else { continue }
+            guard let center = GolfGeometry.centroid(ofRings: candidate.boundary),
+                  GolfGeometry.isInside(center, rings: primary.boundary) else { continue }
             add(candidate)
         }
 
         let ordered = collected.sorted {
-            GolfGeometry.ringArea($0.boundary) > GolfGeometry.ringArea($1.boundary)
+            GolfGeometry.polygonArea($0.boundary) > GolfGeometry.polygonArea($1.boundary)
         }
         guard !ordered.isEmpty else { return [] }
 
@@ -399,26 +500,28 @@ nonisolated enum OSMCourseBuilder {
     }
 
     /// Key of the smallest-area boundary in `boundaries` that contains `point`, or
-    /// `nil` when none do. Resolves overlap when courses nest.
-    private static func smallestContainer(of point: Coordinate, in boundaries: [String: [Coordinate]]) -> String? {
+    /// `nil` when none do. Resolves overlap when courses nest. Boundaries are
+    /// multi-ring polygons; containment uses the even-odd rule across all rings.
+    private static func smallestContainer(of point: Coordinate, in boundaries: [String: [[Coordinate]]]) -> String? {
         boundaries
-            .filter { GolfGeometry.isInside(point, polygon: $0.value) }
-            .min { GolfGeometry.ringArea($0.value) < GolfGeometry.ringArea($1.value) }?
+            .filter { GolfGeometry.isInside(point, rings: $0.value) }
+            .min { GolfGeometry.polygonArea($0.value) < GolfGeometry.polygonArea($1.value) }?
             .key
     }
 
-    /// A candidate course boundary (relation or way) with its stitched ring.
+    /// A candidate course boundary (relation or way) with its assembled rings. A way
+    /// is a single ring; a `type=multipolygon` relation may be several disjoint rings.
     private struct CourseBoundary {
         let id: Int64
         let osmType: String
         let name: String?
         let tags: [String: String]
-        let boundary: [Coordinate]
+        let boundary: [[Coordinate]]
     }
 
     /// Every valid `leisure=golf_course` boundary in the response — relations and
     /// ways alike — with mis-tagged feature areas (driving ranges) excluded and
-    /// degenerate rings (< 3 points) dropped.
+    /// boundaries with no ring of ≥ 3 points dropped.
     private static func courseBoundaries(
         relationsByID: [Int64: OverpassRelation],
         waysByID: [Int64: OverpassWay],
@@ -430,7 +533,7 @@ nonisolated enum OSMCourseBuilder {
                 CourseBoundary(
                     id: relation.id, osmType: "relation",
                     name: relation.tags?["name"], tags: relation.tags ?? [:],
-                    boundary: boundaryCoordinates(for: relation, waysByID: waysByID, nodesByID: nodesByID)
+                    boundary: boundaryRings(for: relation, waysByID: waysByID, nodesByID: nodesByID)
                 )
             }
         let ways = waysByID.values
@@ -439,10 +542,10 @@ nonisolated enum OSMCourseBuilder {
                 CourseBoundary(
                     id: way.id, osmType: "way",
                     name: way.tags?["name"], tags: way.tags ?? [:],
-                    boundary: coordinates(for: way, nodesByID: nodesByID)
+                    boundary: [coordinates(for: way, nodesByID: nodesByID)]
                 )
             }
-        return (relations + ways).filter { $0.boundary.count >= 3 }
+        return (relations + ways).filter { $0.boundary.contains { $0.count >= 3 } }
     }
 
     /// True for an element that represents a whole golf course rather than a feature
@@ -465,15 +568,17 @@ nonisolated enum OSMCourseBuilder {
         }
     }
 
-    private static func boundaryCoordinates(
+    private static func boundaryRings(
         for relation: OverpassRelation,
         waysByID: [Int64: OverpassWay],
         nodesByID: [Int64: OverpassNode]
-    ) -> [Coordinate] {
-        // OSM splits a large outer boundary across multiple ways stored in arbitrary
-        // order and direction. Stitch them into a single ordered ring by matching
-        // shared endpoints; blindly concatenating them yields crossing edges and a
-        // self-intersecting polygon that renders as jagged wedges.
+    ) -> [[Coordinate]] {
+        // OSM splits each outer boundary across multiple ways stored in arbitrary
+        // order and direction, and a `type=multipolygon` course has SEVERAL disjoint
+        // outer loops (TPC Sawgrass is 4 parcels split by water/roads/housing).
+        // Assemble every closed ring — stitching one loop until it closes, then
+        // starting the next from the leftover segments — so outlying parcels (and the
+        // holes inside them) are not dropped.
         //
         // With `out geom` the relation's member ways carry their geometry inline, so
         // prefer that and fall back to the way table for node-reference responses.
@@ -485,11 +590,51 @@ nonisolated enum OSMCourseBuilder {
                 }
                 return waysByID[member.ref].map { coordinates(for: $0, nodesByID: nodesByID) } ?? []
             }
-        return stitchRing(from: segments)
+        return assembleRings(from: segments)
     }
 
-    /// Greedily connects boundary segments end-to-end, reversing a segment when its
-    /// matching endpoint faces the wrong way, until no further segment connects.
+    /// Assembles boundary segments into one or more closed rings. Extends the current
+    /// ring from either endpoint (reversing a segment that faces the wrong way) and
+    /// stops as soon as the ring closes — critically, this prevents a separate disjoint
+    /// loop from being merged onto the first. Any leftover segments seed the next ring,
+    /// so a multipolygon yields all of its disjoint pieces.
+    private static func assembleRings(from segments: [[Coordinate]]) -> [[Coordinate]] {
+        var remaining = segments.filter { $0.count >= 2 }
+        var rings: [[Coordinate]] = []
+
+        while !remaining.isEmpty {
+            var ring = remaining.removeFirst()
+
+            while ring.first != ring.last {
+                guard let ringStart = ring.first, let ringEnd = ring.last else { break }
+                let match = remaining.enumerated().first { _, seg in
+                    seg.first == ringEnd || seg.last == ringEnd ||
+                    seg.first == ringStart || seg.last == ringStart
+                }
+                guard let (index, seg) = match else { break }
+                remaining.remove(at: index)
+
+                if seg.first == ringEnd {
+                    ring.append(contentsOf: seg.dropFirst())
+                } else if seg.last == ringEnd {
+                    ring.append(contentsOf: seg.reversed().dropFirst())
+                } else if seg.last == ringStart {
+                    ring.insert(contentsOf: seg.dropLast(), at: 0)
+                } else { // seg.first == ringStart
+                    ring.insert(contentsOf: seg.reversed().dropLast(), at: 0)
+                }
+            }
+
+            if ring.count >= 3 { rings.append(ring) }
+        }
+
+        return rings
+    }
+
+    /// Greedily connects boundary segments end-to-end into a SINGLE ring, reversing a
+    /// segment when its matching endpoint faces the wrong way. Used for multipolygon
+    /// *features* (a fairway/green), which are a single area rather than a course made
+    /// of disjoint parcels.
     private static func stitchRing(from segments: [[Coordinate]]) -> [Coordinate] {
         var remaining = segments.filter { $0.count >= 2 }
         guard !remaining.isEmpty else { return [] }
@@ -609,6 +754,26 @@ nonisolated enum GolfGeometry {
         return inside
     }
 
+    /// Multi-ring point-in-polygon test using the even-odd rule across every ring.
+    /// Correct for both a course made of disjoint outer parcels (inside iff inside one
+    /// of them) and a donut with an inner cutout (the cutout reads as outside).
+    static func isInside(_ point: Coordinate, rings: [[Coordinate]]) -> Bool {
+        var inside = false
+        for ring in rings where ring.count >= 3 {
+            var j = ring.count - 1
+            for i in 0..<ring.count {
+                let a = ring[i]
+                let b = ring[j]
+                if (a.lat > point.lat) != (b.lat > point.lat),
+                   point.lon < (b.lon - a.lon) * (point.lat - a.lat) / (b.lat - a.lat) + a.lon {
+                    inside.toggle()
+                }
+                j = i
+            }
+        }
+        return inside
+    }
+
     /// Absolute polygon area via the shoelace formula, in degree². Only meaningful
     /// for *comparing* boundaries (largest wins), not as a real-world measurement.
     static func ringArea(_ coords: [Coordinate]) -> Double {
@@ -620,6 +785,19 @@ nonisolated enum GolfGeometry {
             sum += a.lon * b.lat - b.lon * a.lat
         }
         return abs(sum) / 2
+    }
+
+    /// Total area of a multi-ring polygon (sum of its rings). Used to compare whole
+    /// boundaries — e.g. to pick the largest as the facility primary.
+    static func polygonArea(_ rings: [[Coordinate]]) -> Double {
+        rings.reduce(0) { $0 + ringArea($1) }
+    }
+
+    /// A point guaranteed to lie inside a multi-ring polygon: the centroid of its
+    /// largest ring. (The area-weighted centroid of disjoint rings can fall in the gap
+    /// between them, so the largest ring's centroid is used for containment tests.)
+    static func centroid(ofRings rings: [[Coordinate]]) -> Coordinate? {
+        rings.max { ringArea($0) < ringArea($1) }.flatMap { centroid(of: $0) }
     }
 
     /// Area-weighted polygon centroid, falling back to the vertex average for a

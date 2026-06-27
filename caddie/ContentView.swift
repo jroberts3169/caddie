@@ -457,22 +457,21 @@ struct ContentView: View {
     }
 
     /// Assigns the boundary outline(s), ignoring stale results for a course that is
-    /// no longer the displayed one.
-    ///  - Active sub-course → one outline: that sub-course's own boundary.
-    ///  - "All" on a facility → one outline per sub-course, so every course boundary
-    ///    is drawn simultaneously (e.g. both Balboa rings, all 5 Bethpage hulls).
-    ///  - Single course (no sub-courses) → one outline: the whole-course boundary.
+    /// no longer the displayed one. A boundary is a multi-ring polygon (a course can
+    /// be several disjoint parcels), so each ring becomes its own `MapPolygon`.
+    ///  - Active sub-course → that sub-course's rings.
+    ///  - "All" or a single course → the facility's primary boundary rings.
     func applyOutline(from osmCourse: OSMCourse?, for course: GolfCourse) {
         guard displayedCourse?.identifier == course.identifier, let osmCourse else { return }
-        func clCoords(_ ring: [Coordinate]) -> [CLLocationCoordinate2D] {
-            ring.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        func clRings(_ polygon: [[Coordinate]]) -> [[CLLocationCoordinate2D]] {
+            polygon
+                .filter { $0.count >= 3 }
+                .map { ring in ring.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) } }
         }
         if let sub = activeSubCourse(in: osmCourse) {
-            // A specific sub-course is selected: draw only its boundary.
-            courseOutlines = [clCoords(sub.boundary)]
+            courseOutlines = clRings(sub.boundary)
         } else {
-            // "All" or a single course: draw the facility's primary boundary ring.
-            courseOutlines = [clCoords(osmCourse.boundary)]
+            courseOutlines = clRings(osmCourse.boundary)
         }
     }
 
@@ -643,7 +642,7 @@ struct ContentView: View {
     private func logOSMCourse(_ osmCourse: OSMCourse, encoded: Data, identifier: String) {
         osmLog("fetched id=\(identifier)")
         osmLog("      osm: \(osmCourse.osmType) \(osmCourse.osmIdentifier) name=\(osmCourse.name ?? "nil")")
-        osmLog("      boundary points: \(osmCourse.boundary.count)")
+        osmLog("      boundary: \(osmCourse.boundary.count) ring(s), \(osmCourse.boundary.reduce(0) { $0 + $1.count }) points")
         osmLog("      holes: \(osmCourse.holes.count)")
         osmLog("      features: \(osmCourse.features.count)")
 

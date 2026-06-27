@@ -190,3 +190,46 @@ and lay the groundwork to progressively draw the rest of the OSM objects
   so a larger neighbouring club could have hijacked the displayed course.
 - Debug build `** BUILD SUCCEEDED **`. Not yet exercised in the running GUI.
 - All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.
+
+## Multi-ring course boundaries (TPC Sawgrass holes outside boundary)
+- [x] Multi-ring `GolfGeometry` helpers (`isInside(_,rings:)` even-odd, `polygonArea`, `centroid(ofRings:)`)
+- [x] `assembleRings` close-on-return assembler (4 disjoint rings, drops nothing)
+[])
+- [x] Builder call-sites updated (candidates/centroid/containment/area all multi-ring); `stitchRing` retained for feature stitching
+- [x] Render: `courseOutlines: [[CLLocationCoordinate2D]]`, `ForEach` one polyline per ring, `applyOutline` flattens
+- [x] Debug build `** BUILD SUCCEEDED **`; verified live
+
+### Review
+- Root cause: `stitchRing` built ONE ring and dropped TPC Sawgrass's 3 other
+ 9/36 holes outside the drawn boundary.
+- Verified against LIVE Overpass via Python mirror of the new builder:
+
+    single course, no picker.
+  - **Bethpage**: 1 ring, Tier-1 (Black/Red/Green/Blue/Yellow), 0/90 outside.
+  - **Augusta**: 1 ring, Tier-1 (Augusta National 18 + Par 3 9), 0/27 outside.
+  - **Coronado**: single course, 0/18 outside.
+  - **Balboa**: relation 3573430, 1 ring; 9/39 "outside" = the Executive 9, a
+    separate Tier-2 sub-course polygon. Expected, not a regression ("All" uses the
+    main/championship boundary per prior decision).
+- Tolerant decoder keeps legacy `[Coordinate]` cache rows decoding (wrapped as one
+`[]` to avoid stranding the map.
+- Debug build `** BUILD SUCCEEDED **`. Not yet exercised in the running GUI.
+- All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.
+
+## Split TPC Sawgrass into its two courses (Tier 1b hole-name prefix)
+- [x] Diagnosed: Sawgrass holes are untagged (`golf:course:name` absent) and have NO
+      per-course polygons; the course encodes in the hole `name` ("Stadium N"/"Valley N")
+- [x] Added `holeNameSubCourses` (Tier 1b) + `courseNamePrefix(of:)` to `OSMCourse.swift`
+ single (real polygons beat hulls)
+- [x] Guard: skip Tier 1b when any hole carries `golf:course:name`
+- [x] Debug build `** BUILD SUCCEEDED **`; verified live via app `map_to_area` query
+
+### Review
+- TPC Sawgrass now splits into **Stadium (18)** + **Valley (18)** in the sub-course
+  picker; "All" still shows the whole 4-ring facility boundary + every hole/feature.
+ no split (Balboa
+  still Tier 2 polygons); Augusta (18+9) and Bethpage (5 courses) still Tier 1 (tag).
+- `map_to_area` scopes Sawgrass to its own 36 holes, so neighbouring Sawgrass Country
+  Club (East/West/South) and The Yards holes don't leak into the split.
+ glossary unchanged.
+- Debug build `** BUILD SUCCEEDED **`. All changes uncommitted on `fix/layer-draw-order`.
