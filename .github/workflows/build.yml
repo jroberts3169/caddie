@@ -1,0 +1,144 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag (e.g. v1.0.0). Will be created and pushed.'
+        required: true
+
+jobs:
+  build-and-release:
+    name: Build Release and Publish
+    runs-on: macos-26
+    permissions:
+      contents: write
+
+    env:
+      # Notarization credentials (set these as repository secrets)
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # Base64-encoded signing certificate (.p12) and its password
+      SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.SIGNING_CERTIFICATE_P12_BASE64 }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+
+      # Developer ID identity name used by codesign 
+      SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+
+      # Xcode Version
+      XCODE_VER: 26.5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Determine release version
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "marketing=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (build #${{ github.run_number }})"
+
+      - name: Import signing certificate into keychain
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$SIGNING_CERTIFICATE_P12_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$SIGNING_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_${{ env.XCODE_VER }}.app
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Resolve dependencies
+        run: |
+          xcodebuild \
+            -project caddie.xcodeproj \
+            -scheme caddie \
+            -derivedDataPath build/DerivedData \
+            -resolvePackageDependencies
+
+      - name: Build release archive
+        run: |
+          mkdir -p build
+          xcodebuild \
+            -project caddie.xcodeproj \
+            -scheme caddie \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath build/DerivedData \
+            -archivePath build/caddie.xcarchive \
+            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            MARKETING_VERSION="${{ steps.version.outputs.marketing }}" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            archive
+
+      - name: Assemble app bundle
+        run: |
+          mkdir -p build/release
+          cp -R build/caddie.xcarchive/Products/Applications/caddie.app build/release/
+          echo "APP_PATH=build/release/caddie.app" >> "$GITHUB_ENV"
+
+      - name: Verify code signature
+        run: codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+      - name: Create distributable archive (zip)
+        run: |
+          ZIP_PATH="build/release/caddie-${{ steps.version.outputs.tag }}.zip"
+          /usr/bin/ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
+
+      - name: Notarize archive
+        run: |
+          xcrun notarytool submit "$ZIP_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      # Re-zip the stapled app so the distributed archive contains the ticket.
+      - name: Staple notarization ticket
+        run: |
+          xcrun stapler staple "$APP_PATH"
+          rm -f "$ZIP_PATH"
+          /usr/bin/ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-${{ steps.version.outputs.tag }}
+          path: build/release/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3.0.0
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: build/release/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

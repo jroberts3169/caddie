@@ -186,8 +186,12 @@ struct ContentView: View {
     /// the same course JOIN the same task and both apply its result, instead of the
     /// second caller racing the first (and going blank if the first is cancelled).
     @State private var inFlightFetches: [String: Task<OSMCourse?, Error>] = [:]
+    /// Geocoded coordinate for the course marker, resolved from the full street
+    /// address + city + country. `nil` while geocoding is in flight or if it fails,
+    /// in which case the marker falls back to `displayedCourse.coordinate`.
+    @State private var markerCoordinate: CLLocationCoordinate2D?
 
-    private let cameraBounds = MapCameraBounds(minimumDistance: 300, maximumDistance: 8000)
+    private let cameraBounds = MapCameraBounds(minimumDistance: 200, maximumDistance: 8000)
     
     var body: some View {
         NavigationSplitView {
@@ -208,8 +212,20 @@ struct ContentView: View {
             }
         }
         .onChange(of: selection) { _, newValue in
-            guard let course = newValue?.course else { return }
+            guard let course = newValue?.course else {
+                markerCoordinate = nil
+                return
+            }
             displayedCourse = course
+            markerCoordinate = nil
+            Task {
+                let query = [course.address, course.city, course.country]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: ", ")
+                let mapItems = try? await MKGeocodingRequest(addressString: query)?.mapItems
+                guard displayedCourse?.identifier == course.identifier else { return }
+                markerCoordinate = mapItems?.first?.location.coordinate
+            }
             courseOutlines = []
             courseFeatures = []
             courseHoles = []
@@ -270,7 +286,7 @@ struct ContentView: View {
                 }
             }
             if let displayedCourse {
-                Marker(displayedCourse.name, coordinate: displayedCourse.coordinate)
+                Marker(displayedCourse.name, coordinate: markerCoordinate ?? displayedCourse.coordinate)
             }
         }
         .mapStyle(MapStyle.imagery(elevation: .realistic))

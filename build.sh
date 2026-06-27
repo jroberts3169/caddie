@@ -115,6 +115,80 @@ if [[ "${1:-}" == "profile" ]]; then
   exit 0
 fi
 
+# dist: build a Release binary, sign with Developer ID, notarize with Apple, and
+# staple the ticket — producing a Gatekeeper-approved .app ready to share.
+#
+# Required env vars (set in your shell or a local .env file you source first):
+#   APPLE_ID          your Apple ID email
+#   APPLE_APP_PASSWORD  an app-specific password from appleid.apple.com
+#
+# The Developer ID certificate and team ID are derived automatically from
+# the keychain / project settings (team WK2V2PZM2Y).
+if [[ "${1:-}" == "dist" ]]; then
+  CONFIG="Release"
+  BUILD_DIR="build/$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')"
+  APP="$BUILD_DIR/$CONFIG/$SCHEME.app"
+  TEAM_ID="WK2V2PZM2Y"
+  ZIP="build/release/${SCHEME}-dist.zip"
+
+  : "${APPLE_ID:?APPLE_ID env var is required for notarization}"
+  : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD env var is required for notarization}"
+
+  quit_app
+
+  echo "Cleaning build/ and .derived/…"
+  rm -rf build .derived
+
+  build_app "$CONFIG" "$BUILD_DIR"
+
+  if [[ ! -d "$APP" ]]; then
+    echo "Build succeeded but app not found at expected path: $APP" >&2
+    exit 1
+  fi
+
+  # Resolve the Developer ID certificate from the keychain automatically.
+  SIGN_ID=$(security find-identity -v -p codesigning | \
+    grep "Developer ID Application" | grep "$TEAM_ID" | \
+    head -1 | awk -F'"' '{print $2}')
+
+  if [[ -z "$SIGN_ID" ]]; then
+    echo "No 'Developer ID Application' certificate found for team $TEAM_ID." >&2
+    echo "Install it from developer.apple.com/account → Certificates." >&2
+    exit 1
+  fi
+
+  echo "Signing with: $SIGN_ID"
+  codesign \
+    --force \
+    --deep \
+    --options runtime \
+    --sign "$SIGN_ID" \
+    "$APP"
+
+  echo "Verifying signature…"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+  spctl --assess --type exec --verbose "$APP" || true   # passes once notarized
+
+  echo "Zipping for notarization…"
+  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+
+  echo "Submitting to Apple Notary Service (this may take a few minutes)…"
+  xcrun notarytool submit "$ZIP" \
+    --apple-id "$APPLE_ID" \
+    --team-id "$TEAM_ID" \
+    --password "$APPLE_APP_PASSWORD" \
+    --wait
+
+  echo "Stapling notarization ticket…"
+  xcrun stapler staple "$APP"
+
+  echo
+  echo "Done. Distributable app: $APP"
+  echo "Verify with: spctl --assess --type exec --verbose \"$APP\""
+  exit 0
+fi
+
 CONFIG="${1:-Debug}"
 BUILD_DIR="build/$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')"
 
