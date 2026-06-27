@@ -155,7 +155,7 @@ struct ContentView: View {
     @Environment(\.osmFetcher) private var osmFetcher
     @Environment(OverlaySettings.self) private var overlay
     @Query(sort: \RecentCourse.lastVisited, order: .reverse) private var recents: [RecentCourse]
-    @Query(sort: \FavoriteCourse.dateFavorited, order: .reverse) private var favorites: [FavoriteCourse]
+    @Query(sort: \FavoriteCourse.name, order: .forward) private var favorites: [FavoriteCourse]
     @State private var searchText: String = ""
     @State private var searchResults: [GolfCourse] = []
     @State private var selection: SidebarSelection?
@@ -193,11 +193,15 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             Map(position: $cameraPosition) {
+                // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
+                // the outline draws above the translucent turf fills at `.aboveRoads`
+                // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
                 if overlay.isVisible(.boundary) {
                     ForEach(courseOutlines.indices, id: \.self) { i in
                         MapPolygon(coordinates: courseOutlines[i])
                             .foregroundStyle(.gray.opacity(0.0))
                             .stroke(overlay.color(for: .boundary), lineWidth: 3)
+                            .mapOverlayLevel(level: .aboveLabels)
                     }
                 }
                 ForEach(courseFeatures, id: \.osmIdentifier) { feature in
@@ -215,7 +219,7 @@ struct ContentView: View {
                 }
             }
             .mapStyle(MapStyle.imagery(elevation: .realistic))
-            .overlay(alignment: .top) {
+            .overlay(alignment: .center) {
                 loadingBanner
             }
             .overlay(alignment: .bottom) {
@@ -310,6 +314,14 @@ struct ContentView: View {
             Marker(holeMarkerTitle(hole), coordinate: tee)
                 .tint(holeColor)
         }
+
+        if let pin = coords.last {
+            Annotation("", coordinate: pin) {
+                Circle()
+                    .fill(holeColor)
+                    .frame(width: 9, height: 9)
+            }
+        }
     }
 
     /// Compact hole label, e.g. "3 · Par 4 · 410y".
@@ -329,7 +341,7 @@ struct ContentView: View {
     private var loadingBanner: some View {
         HStack(spacing: 8) {
             ProgressView()
-                .controlSize(.small)
+                .controlSize(.large)
             Text("Loading course…")
                 .font(.callout)
         }
@@ -755,6 +767,7 @@ struct ContentView: View {
                         courseRow(course: course, subtitle: nil)
                             .tag(SidebarSelection.favorite(course))
                         subCourseRows(for: course)
+                        
                     }
                 }
             }

@@ -197,3 +197,28 @@ off-main re-decode on a later selection).
 
 Project note: `caddie.xcodeproj` uses `PBXFileSystemSynchronizedRootGroup`, so a new
 `.swift` file dropped into `caddie/` is compiled  no pbxproj edit.automatically 
+
+### Two-tier map layering: levels are coarse, drawOrder is fine (boundary under rough)
+
+At Pebble Beach the course boundary was covered by the rough. Root cause: the app has
+TWO independent z mechanisms and they were conflated.
+
+1. **MapKit overlay LEVEL** (`.mapOverlayLevel( the coarse z-axis with twolevel:)`) 
+   buckets, `.aboveRoads` and `.aboveLabels`. Everything at `.aboveLabels` draws above
+   everything at `.aboveRoads`, unconditionally. `drawOrder` CANNOT cross this.
+2. **`OverlayLayer.drawOrder:  only sorts the `courseFeatures` array *withinInt`** 
+   the single `.aboveRoads` pass* (in `applyFeatures`). Within one level, array order
+   is z-order.
+
+Turf features are pinned to `.aboveRoads`; the boundary `MapPolygon` had NO level, so
+the rough's translucent fill (`opacity 0.55`) composited over the outline. Fix: pin
+the boundary to `. the SAME mechanism already used for hole centerlines.aboveLabels` 
+"Ordering it like the others" via `drawOrder` could never have fixed it (wrong level).
+
+Model to remember:
+- **Structure layers** (boundary, holes) = their own `body` blocks, geometry differs
+  from features, pinned to `.aboveLabels`. Their `drawOrder` values (-1, 99) are UNREAD
+ they exist only to keep the switch exhaustive. To restack them, change their  
+  `.mapOverlayLevel` in `ContentView`, not `drawOrder`.
+- **Feature layers** (turf) = the sorted `featureOverlay` loop at `.aboveRoads`, ordered
+  by `drawOrder`.
