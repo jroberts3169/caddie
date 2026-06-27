@@ -59,6 +59,10 @@ condition. Add `OSM_DEBUG` to the scheme's *Swift Compiler – Custom Flags →
 Active Compilation Conditions* to print Overpass queries and responses to the
 console.
 
+`DEBUG` builds also add a **Debug ▸ Clear OSM Cache** menu command (⌘⇧K) that
+deletes every cached `OSMCourseData` row so courses re-fetch fresh geometry,
+leaving favorites and recents untouched.
+
 ## Architecture
 
 Caddie is a SwiftUI app backed by SwiftData for persistence. The entire UI is a
@@ -118,9 +122,12 @@ Project documentation lives in the [docs/](docs) directory:
 
 - [UI/UX Glossary](docs/ui-glossary.md) — canonical names for every visible
   element in the app.
+- [iCloud Sync](docs/icloud-sync.md) — design and implementation plan for
+  syncing favorites, recents, and overlay settings across Macs (planned; not yet
+  implemented).
 
 ## Roadmap
 
 - Surface search and fetch errors in the UI instead of failing silently.
-- Add loading indicators for search results and map data.
+- Add a loading indicator for search results.
 - Add an empty-state placeholder to the **Course Sidebar**.

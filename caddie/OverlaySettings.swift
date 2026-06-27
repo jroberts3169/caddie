@@ -51,21 +51,21 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
     }
 
     /// The shipped default color. The boundary is a plain white stroke; every other
-    /// layer falls back to its asset-catalog color so first-run styling is
-    /// identical to the pre-settings appearance.
+    /// layer uses an sRGB `#RRGGBBAA` hex literal so first-run styling is identical
+    /// to the pre-settings appearance.
     var defaultColor: Color {
         switch self {
         case .boundary: return .white
-        case .holes: return Color(.courseHole)
-        case .green: return Color(.courseGreen)
-        case .fairway: return Color(.courseFairway)
-        case .tee: return Color(.courseTee)
-        case .bunker: return Color(.courseBunker)
-        case .rough: return Color(.courseRough)
-        case .water: return Color(.courseWater)
-        case .path: return Color(.coursePath)
-        case .drivingRange: return Color(.courseDrivingRange)
-        case .unknown: return Color(.courseUnknown)
+        case .holes: return Color(hex: "rgb(49, 141, 178)")!
+        case .green: return Color(hex: "rgb(20, 119, 45)")!
+        case .fairway: return Color(hex: "rgb(94, 221, 26)")!
+        case .tee: return Color(hex: "#FFFFFFFF")!
+        case .bunker: return Color(hex: "rgb(247, 255, 133)")!
+        case .rough: return Color(hex: "#215E21FF")!
+        case .water: return Color(hex: "#007AFFFF")!
+        case .path: return Color(hex: "rgb(99, 99, 99)")!
+        case .drivingRange: return Color(hex: "rgb(124, 176, 240)")!
+        case .unknown: return Color(hex: "rgb(255, 0, 0)")!
         }
     }
 
@@ -195,11 +195,27 @@ extension Color {
         #endif
     }
 
-    /// Parses a `#RRGGBBAA` (or `RRGGBBAA`) sRGB hex string.
+    /// Parses an sRGB color from either a `#RRGGBBAA` (or `RRGGBBAA`) hex string
+    /// or a CSS-style `rgb(r, g, b)` / `rgba(r, g, b, a)` string where the
+    /// channels are 0–255 integers and the optional alpha is a 0–255 integer.
     init?(hex: String) {
-        var s = hex
-        if s.hasPrefix("#") { s.removeFirst() }
-        guard s.count == 8, let value = UInt32(s, radix: 16) else { return nil }
+        let s = hex.trimmingCharacters(in: .whitespaces)
+        if s.lowercased().hasPrefix("rgb") {
+            let inside = s.drop(while: { $0 != "(" }).dropFirst().prefix(while: { $0 != ")" })
+            let parts = inside.split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }
+            guard (3...4).contains(parts.count),
+                  let r = Int(parts[0]), let g = Int(parts[1]), let b = Int(parts[2])
+            else { return nil }
+            let a = parts.count == 4 ? (Int(parts[3]) ?? 255) : 255
+            self = Color(.sRGB, red: Double(r) / 255, green: Double(g) / 255,
+                         blue: Double(b) / 255, opacity: Double(a) / 255)
+            return
+        }
+        var hex = s
+        if hex.hasPrefix("#") { hex.removeFirst() }
+        guard hex.count == 8, let value = UInt32(hex, radix: 16) else { return nil }
         let r = Double((value >> 24) & 0xFF) / 255
         let g = Double((value >> 16) & 0xFF) / 255
         let b = Double((value >> 8) & 0xFF) / 255
