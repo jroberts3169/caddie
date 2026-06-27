@@ -149,3 +149,51 @@ Gotcha to remember: name-prefix can't tell "two separate 18-hole courses" from
 "front/back nine of ONE course" by names alone. We accept that risk because OSM
 convention puts genuinely separate courses behind distinct relations/tags; lone
 name prefixes are the last-resort signal. Group case-insensitively ("West"/"west").
+
+### Bidirectional nameMatches is too loose for sub-course polygon preference
+
+`nameMatches` strips "country club", "golf", etc. and returns true when EITHER
+normalized string contains the other. For the PRIMARY selection this is fine (user's
+loose search term vs OSM name). But in the sub-course polygon-preference lookup it's
+a footgun:
+
+ normalized "augusta national"
+ normalized "augusta"
+ country club hijacks the
+  boundary of the Augusta National sub-course. Visually: selecting "Augusta National"
+  showed the Augusta Country Club polygon.
+
+Fix: add ` a STRICT one-directional check wherecandidateContainsGroupName(_:_:)` 
+the **candidate polygon's** normalized name must contain the **group name** normalized
+ correct.
+
+Use `nameMatches` only for primary selection (bidirectional is fine there, because
+user input and OSM names can differ in either direction). Use
+`candidateContainsGroupName` wherever a polygon candidate is being matched against a
+known group name in `tagBasedSubCourses` and `holeNameSubCourses`.
+
+### Bounding a SwiftUI in-memory cache: use a reference type, not a struct
+
+`osmCache` (the L1 decoded-course cache) grew unbounded. Bounding it with an LRU
+surfaced a SwiftUI-specific design rule: an LRU **touches recency on every read**, so
+if the cache is a VALUE type held in `@State`, each lookup reassigns the `@State` and
+**invalidates the  a redraw per cache hit, possibly self-feeding if `body`view** 
+reads the cache. A `final class` held in `@State` is mutated in place; the stored
+reference never changes, so SwiftUI is NOT redrawn by a touch. `@State` then only
+provides a stable lifetime across body recomputations. (This is a deliberate
+exception to the project's @Observable-maximalist rule: here observation is exactly
+what we must avoid.)
+
+No locking needed: with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, an unannotated/
+`@MainActor` class is main-actor isolated, and all cache access is already on main
+(the only off-main work is the JSON decode, whose result is assigned back on main).
+
+Implementing a `subscript(key) -> Value?` (get touches MRU, set upserts+evicts, nil
+removes) on the class let all 5 existing `osmCache[id]` call sites compile **byte-for
+-byte  only the declaration line changed. Array-order LRU (LRU at indexunchanged** 
+0, MRU at end) is O(n) per touch but trivial 16. Eviction is always safecap
+because L2 (SwiftData) + L3 (network) sit behind L1 and self-heal (one ~280 ms
+off-main re-decode on a later selection).
+
+Project note: `caddie.xcodeproj` uses `PBXFileSystemSynchronizedRootGroup`, so a new
+`.swift` file dropped into `caddie/` is compiled  no pbxproj edit.automatically 

@@ -144,6 +144,12 @@ enum SidebarSelection: Hashable {
     }
 }
 
+/// Capacity of the in-memory decoded-course cache (`ContentView.osmCache`). A user
+/// realistically revisits a handful of courses per session, so 16 comfortably covers
+/// a working set (recents + a few comparisons) while bounding worst-case memory at
+/// ~16 decoded courses (tens of MB). Tunable here in one place.
+private let osmCacheCapacity = 16
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.osmFetcher) private var osmFetcher
@@ -168,8 +174,10 @@ struct ContentView: View {
     /// so a new selection can stop a paint that is still in progress.
     @State private var featureRenderTask: Task<Void, Never>?
     /// In-memory decoded-geometry cache, keyed by course id, so re-selecting a
-    /// course in the same session skips the SwiftData fetch + JSON decode.
-    @State private var osmCache: [String: OSMCourse] = [:]
+    /// course in the same session skips the SwiftData fetch + JSON decode. Bounded
+    /// (LRU) so a long browsing session can't grow it without limit; an evicted
+    /// course simply re-decodes from L2 (SwiftData) or refetches on next selection.
+    @State private var osmCache = LRUCache<String, OSMCourse>(capacity: osmCacheCapacity)
     /// Reference-counted set of course ids with an in-flight network fetch. A count
     /// (not a flag) keeps the spinner visible when two fetches for the same course
     /// overlap — the dedup'd second call must not clear it early.

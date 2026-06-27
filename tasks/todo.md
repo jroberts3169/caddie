@@ -233,3 +233,23 @@ and lay the groundwork to progressively draw the rest of the OSM objects
   Club (East/West/South) and The Yards holes don't leak into the split.
  glossary unchanged.
 - Debug build `** BUILD SUCCEEDED **`. All changes uncommitted on `fix/layer-draw-order`.
+
+## Bound osmCache with an LRU cache
+- [x] Added `caddie/LRUCache.swift`: `@MainActor final class LRUCache<Key,Value>`,
+      subscript get(touch MRU)/set(upsert+evict)/nil-remove, removeValue/removeAll/count,
+      DEBUG `osmLog` on eviction
+- [x] No pbxproj edit needed (filesystem-synchronized group auto-includes the file)
+ `LRUCache<String, OSMCourse>(capacity: osmCacheCapacity)`,
+      added `osmCacheCapacity = 16` constant + rationale; 5 call sites unchanged
+- [x] Debug build `** BUILD SUCCEEDED **` (proves call sites compile against subscript)
+- [x] 14/14 LRU assertions pass (eviction, read-promotion, update-in-place, nil-remove,
+      clamp, removeAll, order-array no-leak)
+
+### Review
+- Reference type (class) chosen over a struct so read-time recency touches don't
+  reassign `@State` and redraw the view. No locks (MainActor-default isolation).
+- Capacity 16 (named constant) bounds L1 at ~16 decoded courses (tens of MB worst
+  case); evicted courses self-heal from L2/L3 on next selection (~280 ms off-main).
+- Decision (per 6): left `clearOSMCache()` as L2-only (self-heals); did NOT addplan 
+  an L1  kept the diff surgical. Capacity 16 + DEBUG eviction log included.bridge 
+- All changes uncommitted on `fix/layer-draw-order` per the leave-uncommitted pref.

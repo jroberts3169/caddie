@@ -275,6 +275,18 @@ nonisolated enum OSMCourseBuilder {
         return String(kept).split(separator: " ").joined(separator: " ")
     }
 
+    /// Stricter one-directional match used only for sub-course polygon preference:
+    /// the CANDIDATE polygon's normalized name must contain the GROUP name, not the
+    /// other way around. This prevents "Augusta Country Club" (normalized "augusta")
+    /// from matching the "Augusta National" group via the reverse direction
+    /// ("augusta national".contains("augusta") = true, a false positive with the
+    /// bidirectional `nameMatches`).
+    private static func candidateContainsGroupName(_ candidate: String?, _ groupName: String?) -> Bool {
+        guard let a = normalizedName(candidate), let b = normalizedName(groupName),
+              !a.isEmpty, !b.isEmpty else { return false }
+        return a.contains(b)
+    }
+
     /// Splits a facility into its selectable sub-courses, by a signal cascade:
     ///  - Tier 1 — holes tagged `golf:course:name` (Augusta's 18 + Par 3). Group by
     ///    the tag; each group is a sub-course whose boundary is a convex hull of its
@@ -341,10 +353,11 @@ nonisolated enum OSMCourseBuilder {
         }
 
         // Display boundary: prefer a real mapped polygon whose name matches the group.
-        // Attribution boundary: always the hull (tighter, avoids misattributing features
-        // between overlapping hull and polygon boundary at the edges).
+        // Use the strict directional check (candidate must contain the group name, not
+        // the reverse) so "Augusta Country Club" → normalized "augusta" does NOT match
+        // the "Augusta National" group → normalized "augusta national".
         let displayBoundaries: [String: [[Coordinate]]] = grouped.keys.reduce(into: [:]) { dict, name in
-            if let polygon = candidates.first(where: { nameMatches($0.name, name) }),
+            if let polygon = candidates.first(where: { candidateContainsGroupName($0.name, name) }),
                polygon.boundary.contains(where: { $0.count >= 3 }) {
                 dict[name] = polygon.boundary
             } else {
@@ -404,7 +417,7 @@ nonisolated enum OSMCourseBuilder {
         }
 
         let displayBoundaries: [String: [[Coordinate]]] = plausible.keys.reduce(into: [:]) { dict, key in
-            if let polygon = candidates.first(where: { nameMatches($0.name, names[key]) }),
+            if let polygon = candidates.first(where: { candidateContainsGroupName($0.name, names[key]) }),
                polygon.boundary.contains(where: { $0.count >= 3 }) {
                 dict[key] = polygon.boundary
             } else {
@@ -673,7 +686,7 @@ nonisolated enum OSMCourseBuilder {
                     osmIdentifier: way.id,
                     ref: way.tags?["ref"],
                     par: way.tags?["par"].flatMap(Int.init),
-                    lengthMeters: way.tags?["distance"].flatMap(Double.init),
+                    lengthMeters: (way.tags?["length"] ?? way.tags?["distance"]).flatMap(Double.init),
                     coordinates: coordinates(for: way, nodesByID: nodesByID),
                     tags: way.tags ?? [:]
                 )
