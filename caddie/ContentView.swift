@@ -219,7 +219,7 @@ struct ContentView: View {
                 }
             }
             .mapStyle(MapStyle.imagery(elevation: .realistic))
-            .overlay(alignment: .top) {
+            .overlay(alignment: .center) {
                 loadingBanner
             }
             .overlay(alignment: .bottom) {
@@ -314,6 +314,14 @@ struct ContentView: View {
             Marker(holeMarkerTitle(hole), coordinate: tee)
                 .tint(holeColor)
         }
+
+        if let pin = coords.last {
+            Annotation("", coordinate: pin) {
+                Circle()
+                    .fill(holeColor)
+                    .frame(width: 9, height: 9)
+            }
+        }
     }
 
     /// Compact hole label, e.g. "3 · Par 4 · 410y".
@@ -333,7 +341,7 @@ struct ContentView: View {
     private var loadingBanner: some View {
         HStack(spacing: 8) {
             ProgressView()
-                .controlSize(.small)
+                .controlSize(.large)
             Text("Loading course…")
                 .font(.callout)
         }
