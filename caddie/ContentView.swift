@@ -176,7 +176,10 @@ struct ContentView: View {
     /// The sub-course currently shown, or `nil` when the displayed course is a single
     /// course (or, transiently, before its OSM data has loaded).
     @State private var activeSubCourseID: String?
-    @State private var cameraPosition: MapCameraPosition = .automatic
+    /// The region the map should frame. Tagged with an identity token so
+    /// re-selecting the same course re-frames it (an equal region would otherwise
+    /// be diffed as "no change"). `nil` until the first frame request.
+    @State private var regionRequest: MapRegionRequest?
     /// Cancellable handle for the progressive feature renderer (see `renderChunked`),
     /// so a new selection can stop a paint that is still in progress.
     @State private var featureRenderTask: Task<Void, Never>?
@@ -249,7 +252,7 @@ struct ContentView: View {
             activeSubCourseID = nil
             // Stop any progressive overlay render still painting the previous course.
             featureRenderTask?.cancel()
-            cameraPosition = .region(MKCoordinateRegion(
+            regionRequest = MapRegionRequest(region: MKCoordinateRegion(
                 center: course.coordinate,
                 latitudinalMeters: 2000,
                 longitudinalMeters: 2000
@@ -286,43 +289,17 @@ struct ContentView: View {
     }
 
     private var courseMap: some View {
-        Map(position: $cameraPosition) {
-            // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
-            // the outline draws above the translucent turf fills at `.aboveRoads`
-            // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
-            if overlay.isVisible(.boundary) {
-                ForEach(courseOutlines.indices, id: \.self) { i in
-                    MapPolygon(coordinates: courseOutlines[i])
-                        .foregroundStyle(.gray.opacity(0.0))
-                        .stroke(overlay.color(for: .boundary), lineWidth: 3)
-                        .mapOverlayLevel(level: .aboveLabels)
-                }
-            }
-            ForEach(courseFeatures, id: \.osmIdentifier) { feature in
-                featureOverlay(feature)
-            }
-            // Drawn last so the dashed hole centerlines sit on top of the
-            // fairway/green fills rather than being composited under them.
-            if overlay.isVisible(.holes) {
-                ForEach(courseHoles, id: \.osmIdentifier) { hole in
-                    holeOverlay(hole)
-                }
-            }
-            if let displayedCourse {
-                Marker(displayedCourse.name, coordinate: markerCoordinate ?? displayedCourse.coordinate)
-            }
-            // Golf courses within 50 miles of the person's location. Hidden once a
-            // specific course is opened so its overlays aren't cluttered by pins.
-            if displayedCourse == nil {
-                ForEach(nearbyCourses) { course in
-                    Marker(course.name, systemImage: "flag.fill", coordinate: course.coordinate)
-                        .tint(.green)
-                }
-            }
-            // System-styled blue dot at the person's current location.
-            UserAnnotation()
-        }
-        .mapStyle(MapStyle.imagery(elevation: .realistic))
+        CourseMapView(
+            outlines: courseOutlines,
+            features: courseFeatures,
+            holes: courseHoles,
+            displayedCourse: displayedCourse,
+            courseMarkerCoordinate: markerCoordinate,
+            nearbyCourses: nearbyCourses,
+            style: mapStyleConfig,
+            regionRequest: regionRequest
+        )
+        .ignoresSafeArea()
         .overlay(alignment: .center) {
             loadingBanner
         }
@@ -331,63 +308,17 @@ struct ContentView: View {
         }
     }
 
-    /// Map overlay for a single OSM feature: filled polygon for closed areas
-    /// (greens, bunkers, water…), stroked line for open paths. Pinned to the
-    /// `.aboveRoads` level so the hole centerlines (drawn at `.aboveLabels`) stay
-    /// on top of these fills.
-    @MapContentBuilder
-    func featureOverlay(_ feature: OSMFeature) -> some MapContent {
-        let layer = OverlayLayer.forFeature(feature.kind)
-        if overlay.isVisible(layer) {
-            let coords = feature.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-            let color = overlay.color(for: layer)
-            if feature.isClosed, coords.count >= 3 {
-                MapPolygon(coordinates: coords)
-                    .foregroundStyle(color.opacity(0.55))
-                    .stroke(color, lineWidth: 1)
-                    .mapOverlayLevel(level: .aboveRoads)
-            } else if coords.count >= 2 {
-                MapPolyline(coordinates: coords)
-                    .stroke(color, lineWidth: 2)
-                    .mapOverlayLevel(level: .aboveRoads)
-            }
+    /// Flattens the `@Observable` `OverlaySettings` into a value-type snapshot the
+    /// `CourseMapView` representable can diff. Reading `overlay` here (in the view
+    /// body) is what registers the dependency, so a Settings change re-renders.
+    private var mapStyleConfig: MapStyleConfig {
+        var colors: [OverlayLayer: NSColorBox] = [:]
+        var visible: [OverlayLayer: Bool] = [:]
+        for layer in OverlayLayer.allCases {
+            colors[layer] = NSColorBox(color: NSColor(overlay.color(for: layer)))
+            visible[layer] = overlay.isVisible(layer)
         }
-    }
-
-    /// Map overlay for a single hole: the tee→green centerline plus a numbered
-    /// marker at the tee carrying par/length detail.
-    @MapContentBuilder
-    func holeOverlay(_ hole: OSMHole) -> some MapContent {
-        let holeColor = overlay.color(for: .holes)
-        let coords = hole.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-        if coords.count >= 2 {
-            MapPolyline(coordinates: coords)
-                .stroke(holeColor, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
-                .mapOverlayLevel(level: .aboveLabels)
-        }
-        if let tee = coords.first {
-            Marker(holeMarkerTitle(hole), coordinate: tee)
-                .tint(holeColor)
-        }
-
-        if let pin = coords.last {
-            Annotation("", coordinate: pin) {
-                Circle()
-                    .fill(holeColor)
-                    .frame(width: 9, height: 9)
-            }
-        }
-    }
-
-    /// Compact hole label, e.g. "3 · Par 4 · 410y".
-    private func holeMarkerTitle(_ hole: OSMHole) -> String {
-        var parts: [String] = []
-        if let ref = hole.ref, !ref.isEmpty { parts.append(ref) }
-        if let par = hole.par { parts.append("Par \(par)") }
-        if let meters = hole.lengthMeters {
-            parts.append("\(Int((meters * 1.09361).rounded()))y")
-        }
-        return parts.isEmpty ? "Hole" : parts.joined(separator: " · ")
+        return MapStyleConfig(colors: colors, visible: visible)
     }
 
     /// Subtle, non-blocking progress chip shown while the displayed course's data is
@@ -860,7 +791,7 @@ struct ContentView: View {
 
         // Frame everything: all course markers plus the user's own location.
         guard displayedCourse == nil else { return }
-        cameraPosition = .region(regionFitting(courses.map(\.coordinate) + [center]))
+        regionRequest = MapRegionRequest(region: regionFitting(courses.map(\.coordinate) + [center]))
     }
 
     /// Builds an `MKCoordinateRegion` that encloses every coordinate with a little
