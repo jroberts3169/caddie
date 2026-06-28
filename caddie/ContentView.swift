@@ -251,6 +251,7 @@ struct ContentView: View {
         }
         .navigationTitle(displayedCourse?.name ?? "Caddie")
         .navigationSubtitle(displayedCourse.map { locationSubtitle(for: $0) ?? "" } ?? "")
+        .background(FullScreenToolbarAutoHide())
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
         .onChange(of: searchText) { _, newValue in
             if newValue.isEmpty {

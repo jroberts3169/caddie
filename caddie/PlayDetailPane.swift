@@ -70,12 +70,6 @@ struct PlayDetailPane: View {
             }
 
             Spacer()
-
-            // ── Hole dots ───────────────────────────────────────────────────
-            if !holes.isEmpty {
-                holeDots
-                    .padding(.bottom, 16)
-            }
         }
         .inspectorColumnWidth(min: 220, ideal: 260, max: 320)
     }
@@ -100,19 +94,5 @@ struct PlayDetailPane: View {
                 .monospacedDigit()
         }
         .font(.body)
-    }
-
-    private var holeDots: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(holes.indices, id: \.self) { idx in
-                    Circle()
-                        .fill(idx == currentHoleIndex ? Color.accentColor : Color.secondary.opacity(0.4))
-                        .frame(width: 8, height: 8)
-                        .onTapGesture { currentHoleIndex = idx }
-                }
-            }
-            .padding(.horizontal, 16)
-        }
     }
 }
