@@ -364,6 +364,15 @@ extension CourseMapView {
             }
             for h in holes { hasher.combine(h.osmIdentifier) }
             hasher.combine(style.isVisible(.holes))
+            // Fold in the holes color so a color-only Settings change rebuilds the
+            // tee/pin annotations: their tint is baked in by `viewFor`, which MapKit
+            // only re-invokes on add/recycle, not when `currentStyle` changes.
+            if let c = style.colors[.holes]?.color.usingColorSpace(.sRGB) {
+                hasher.combine(c.redComponent)
+                hasher.combine(c.greenComponent)
+                hasher.combine(c.blueComponent)
+                hasher.combine(c.alphaComponent)
+            }
             let hash = hasher.finalize()
             guard hash != appliedAnnotationHash else { return }
             appliedAnnotationHash = hash

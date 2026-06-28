@@ -157,6 +157,27 @@ enum SidebarSelection: Hashable {
 /// ~16 decoded courses (tens of MB). Tunable here in one place.
 private let osmCacheCapacity = 16
 
+enum AppMode: String, CaseIterable {
+    case plan = "Plan"
+    case play = "Play"
+
+    /// SF Symbol shown in the toolbar toggle for this mode.
+    var symbol: String {
+        switch self {
+        case .plan: return "map"
+        case .play: return "figure.golf"
+        }
+    }
+
+    /// The mode this one toggles to.
+    var toggled: AppMode {
+        switch self {
+        case .plan: return .play
+        case .play: return .plan
+        }
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.osmFetcher) private var osmFetcher
@@ -206,6 +227,10 @@ struct ContentView: View {
     /// Golf courses found within `nearbyRadiusMeters` of the person's location,
     /// shown as markers on the map. Empty until a fix resolves.
     @State private var nearbyCourses: [GolfCourse] = []
+    /// Whether the user is planning (browsing) or actively playing the course.
+    @State private var appMode: AppMode = .plan
+    /// The hole currently focused in the Play detail pane.
+    @State private var currentHoleIndex: Int = 0
 
     /// Radius for the "courses near me" search: 50 miles in meters.
     private static let nearbyRadiusMeters: CLLocationDistance = 80_467
@@ -217,6 +242,12 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             courseMap
+                .inspector(isPresented: Binding(
+                    get: { appMode == .play && displayedCourse != nil },
+                    set: { if !$0 { appMode = .plan } }
+                )) {
+                    PlayDetailPane(holes: courseHoles, currentHoleIndex: $currentHoleIndex)
+                }
         }
         .navigationTitle(displayedCourse?.name ?? "Caddie")
         .navigationSubtitle(displayedCourse.map { locationSubtitle(for: $0) ?? "" } ?? "")
@@ -233,6 +264,7 @@ struct ContentView: View {
         .onChange(of: selection) { _, newValue in
             guard let course = newValue?.course else {
                 markerCoordinate = nil
+                appMode = .plan
                 return
             }
             displayedCourse = course
@@ -250,6 +282,7 @@ struct ContentView: View {
             courseHoles = []
             displayedSubCourses = []
             activeSubCourseID = nil
+            currentHoleIndex = 0
             // Stop any progressive overlay render still painting the previous course.
             featureRenderTask?.cancel()
             regionRequest = MapRegionRequest(region: MKCoordinateRegion(
@@ -286,6 +319,72 @@ struct ContentView: View {
                   let coordinate = await locationManager.currentCoordinate() else { return }
             await loadNearbyCourses(around: coordinate)
         }
+        .toolbar {
+            if displayedCourse != nil {
+                ToolbarItem(placement: .navigation) {
+                    Button {
+                        appMode = appMode.toggled
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: appMode.symbol)
+                                .frame(width: 16)
+                            Text(appMode.rawValue)
+                                .fixedSize()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                    }
+                    .help("Switch to \(appMode.toggled.rawValue) mode")
+                }
+            }
+            if displayedSubCourses.count > 1 {
+                ToolbarItem(placement: .navigation) {
+                    Menu {
+                        Button {
+                            activeSubCourseID = nil
+                        } label: {
+                            HStack {
+                                Text("All")
+                                if activeSubCourseID == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                        Divider()
+                        ForEach(displayedSubCourses) { sub in
+                            Button {
+                                activeSubCourseID = sub.id
+                            } label: {
+                                HStack {
+                                    Text(subCourseLabel(sub))
+                                    if activeSubCourseID == sub.id {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "flag")
+                                .frame(width: 16)
+                            Text(activeSubCourseLabel)
+                                .fixedSize()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                    }
+                    .menuStyle(.button)
+                }
+            }
+        }
+    }
+
+    private var activeSubCourseLabel: String {
+        guard let id = activeSubCourseID,
+              let sub = displayedSubCourses.first(where: { $0.id == id }) else {
+            return "All"
+        }
+        return subCourseLabel(sub)
     }
 
     private var courseMap: some View {
@@ -302,9 +401,6 @@ struct ContentView: View {
         .ignoresSafeArea()
         .overlay(alignment: .center) {
             loadingBanner
-        }
-        .overlay(alignment: .bottom) {
-            subCoursePicker
         }
     }
 
@@ -338,27 +434,6 @@ struct ContentView: View {
         .opacity(isLoadingDisplayed ? 1 : 0)
         .animation(.easeInOut(duration: 0.2), value: isLoadingDisplayed)
         .allowsHitTesting(false)
-    }
-
-    /// Floating segmented control for switching between a facility's sub-courses
-    /// (e.g. Balboa Park's Championship / Executive). Hidden for ordinary single
-    /// courses. Mirrors — and is kept in sync with — the sidebar disclosure.
-    @ViewBuilder
-    private var subCoursePicker: some View {
-        if displayedSubCourses.count > 1 {
-            Picker("Course", selection: $activeSubCourseID) {
-                Text("All").tag(String?.none)
-                ForEach(displayedSubCourses) { sub in
-                    Text(subCourseLabel(sub)).tag(sub.id as String?)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .padding(8)
-            .background(.regularMaterial, in: Capsule())
-            .padding(.bottom, 16)
-        }
     }
 
     /// Compact label for a sub-course segment: the name with a trailing
@@ -902,7 +977,7 @@ struct ContentView: View {
                 activeSubCourseID = nil
             } label: {
                 HStack {
-                    Label("All Courses", systemImage: "square.stack")
+                    Label("All", systemImage: "square.stack")
                         .font(.subheadline)
                         .lineLimit(1)
                     Spacer()
