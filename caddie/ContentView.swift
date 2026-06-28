@@ -197,8 +197,10 @@ struct ContentView: View {
     /// address + city + country. `nil` while geocoding is in flight or if it fails,
     /// in which case the marker falls back to `displayedCourse.coordinate`.
     @State private var markerCoordinate: CLLocationCoordinate2D?
+    /// Owns the `CLLocationManager` so it stays retained for the view's lifetime;
+    /// without a strong reference the system permission prompt never appears.
+    @State private var locationManager = LocationManager()
 
-    private let cameraBounds = MapCameraBounds(minimumDistance: 200, maximumDistance: 8000)
     
     var body: some View {
         NavigationSplitView {
@@ -268,10 +270,22 @@ struct ContentView: View {
             applyOutline(from: osmCourse, for: course)
             applyFeatures(from: osmCourse, for: course)
         }
+        .task {
+            // Resolve the person's location once and centre the map on it. Uses a
+            // free `.region` (not a follow-mode `.userLocation` position) so manual
+            // zoom/pan isn't fought by the map re-pinning to the user.
+            guard displayedCourse == nil,
+                  let coordinate = await locationManager.currentCoordinate() else { return }
+            cameraPosition = .region(MKCoordinateRegion(
+                center: coordinate,
+                latitudinalMeters: 8000,
+                longitudinalMeters: 8000
+            ))
+        }
     }
 
     private var courseMap: some View {
-        Map(position: $cameraPosition, bounds: cameraBounds) {
+        Map(position: $cameraPosition) {
             // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
             // the outline draws above the translucent turf fills at `.aboveRoads`
             // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
@@ -296,6 +310,8 @@ struct ContentView: View {
             if let displayedCourse {
                 Marker(displayedCourse.name, coordinate: markerCoordinate ?? displayedCourse.coordinate)
             }
+            // System-styled blue dot at the person's current location.
+            UserAnnotation()
         }
         .mapStyle(MapStyle.imagery(elevation: .realistic))
         .overlay(alignment: .center) {
