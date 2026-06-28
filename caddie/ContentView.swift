@@ -200,6 +200,12 @@ struct ContentView: View {
     /// Owns the `CLLocationManager` so it stays retained for the view's lifetime;
     /// without a strong reference the system permission prompt never appears.
     @State private var locationManager = LocationManager()
+    /// Golf courses found within `nearbyRadiusMeters` of the person's location,
+    /// shown as markers on the map. Empty until a fix resolves.
+    @State private var nearbyCourses: [GolfCourse] = []
+
+    /// Radius for the "courses near me" search: 50 miles in meters.
+    private static let nearbyRadiusMeters: CLLocationDistance = 80_467
 
     
     var body: some View {
@@ -271,16 +277,11 @@ struct ContentView: View {
             applyFeatures(from: osmCourse, for: course)
         }
         .task {
-            // Resolve the person's location once and centre the map on it. Uses a
-            // free `.region` (not a follow-mode `.userLocation` position) so manual
-            // zoom/pan isn't fought by the map re-pinning to the user.
+            // Resolve the person's location once, find golf courses within 50 miles,
+            // and frame the map so every marker (and the user dot) is visible.
             guard displayedCourse == nil,
                   let coordinate = await locationManager.currentCoordinate() else { return }
-            cameraPosition = .region(MKCoordinateRegion(
-                center: coordinate,
-                latitudinalMeters: 8000,
-                longitudinalMeters: 8000
-            ))
+            await loadNearbyCourses(around: coordinate)
         }
     }
 
@@ -309,6 +310,14 @@ struct ContentView: View {
             }
             if let displayedCourse {
                 Marker(displayedCourse.name, coordinate: markerCoordinate ?? displayedCourse.coordinate)
+            }
+            // Golf courses within 50 miles of the person's location. Hidden once a
+            // specific course is opened so its overlays aren't cluttered by pins.
+            if displayedCourse == nil {
+                ForEach(nearbyCourses) { course in
+                    Marker(course.name, systemImage: "flag.fill", coordinate: course.coordinate)
+                        .tint(.green)
+                }
             }
             // System-styled blue dot at the person's current location.
             UserAnnotation()
@@ -782,37 +791,100 @@ struct ContentView: View {
         let search = MKLocalSearch(request: request)
         guard let response = try? await search.start() else { return }
 
-        let results = response.mapItems.map { item in
-            let representations = item.addressRepresentations
-            let coordinate = item.location.coordinate
-            let cityName = representations?.cityName ?? ""
-            // `cityWithContext(.short)` yields e.g. "Pebble Beach, CA"; peel off the
-            // leading city to isolate the state/region for separate display.
-            let cityContext = representations?.cityWithContext(.short) ?? ""
-            let state: String
-            if !cityName.isEmpty, cityContext.hasPrefix(cityName + ", ") {
-                state = String(cityContext.dropFirst(cityName.count + 2))
-            } else {
-                state = ""
-            }
-            return GolfCourse(
-                identifier: item.url?.absoluteString ?? UUID().uuidString,
-                name: item.name ?? "Unknown",
-                address: item.address?.shortAddress ?? item.address?.fullAddress ?? "",
-                city: cityName,
-                state: state,
-                country: representations?.regionName ?? "",
-                countryCode: representations?.region?.identifier ?? "",
-                phone: item.phoneNumber ?? "",
-                website: item.url?.absoluteString ?? "",
-                latitude: coordinate.latitude,
-                longitude: coordinate.longitude
-            )
-        }
+        let results = response.mapItems.map(golfCourse(from:))
 
         await MainActor.run {
             searchResults = results
         }
+    }
+
+    /// Converts an `MKMapItem` from a local search into the app's `GolfCourse`,
+    /// peeling the state/region out of the formatted city context. Shared by the
+    /// text search and the nearby search.
+    private func golfCourse(from item: MKMapItem) -> GolfCourse {
+        let representations = item.addressRepresentations
+        let coordinate = item.location.coordinate
+        let cityName = representations?.cityName ?? ""
+        // `cityWithContext(.short)` yields e.g. "Pebble Beach, CA"; peel off the
+        // leading city to isolate the state/region for separate display.
+        let cityContext = representations?.cityWithContext(.short) ?? ""
+        let state: String
+        if !cityName.isEmpty, cityContext.hasPrefix(cityName + ", ") {
+            state = String(cityContext.dropFirst(cityName.count + 2))
+        } else {
+            state = ""
+        }
+        return GolfCourse(
+            identifier: item.url?.absoluteString ?? UUID().uuidString,
+            name: item.name ?? "Unknown",
+            address: item.address?.shortAddress ?? item.address?.fullAddress ?? "",
+            city: cityName,
+            state: state,
+            country: representations?.regionName ?? "",
+            countryCode: representations?.region?.identifier ?? "",
+            phone: item.phoneNumber ?? "",
+            website: item.url?.absoluteString ?? "",
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+    }
+
+    /// Runs a golf-course `MKLocalSearch` over a ~100-mile box around `center`,
+    /// keeps the results inside the 50-mile radius (local search biases toward the
+    /// region but doesn't hard-clip it), and frames the map so every marker and the
+    /// user dot are visible.
+    private func loadNearbyCourses(around center: CLLocationCoordinate2D) async {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = "golf course"
+        request.resultTypes = [.pointOfInterest]
+        request.pointOfInterestFilter = MKPointOfInterestFilter(including: [.golf])
+        request.region = MKCoordinateRegion(
+            center: center,
+            latitudinalMeters: Self.nearbyRadiusMeters * 2,
+            longitudinalMeters: Self.nearbyRadiusMeters * 2
+        )
+
+        let search = MKLocalSearch(request: request)
+        guard let response = try? await search.start() else { return }
+
+        let origin = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        func distance(_ course: GolfCourse) -> CLLocationDistance {
+            origin.distance(from: CLLocation(latitude: course.latitude, longitude: course.longitude))
+        }
+        let courses = response.mapItems
+            .map(golfCourse(from:))
+            .filter { distance($0) <= Self.nearbyRadiusMeters }
+            .sorted { distance($0) < distance($1) }
+
+        nearbyCourses = courses
+
+        // Frame everything: all course markers plus the user's own location.
+        guard displayedCourse == nil else { return }
+        cameraPosition = .region(regionFitting(courses.map(\.coordinate) + [center]))
+    }
+
+    /// Builds an `MKCoordinateRegion` that encloses every coordinate with a little
+    /// padding so edge markers aren't clipped. Enforces a minimum span so a single
+    /// (or tightly clustered) set of markers doesn't zoom in to street level.
+    private func regionFitting(_ coordinates: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+        guard let first = coordinates.first else {
+            return MKCoordinateRegion(.world)
+        }
+        var minLat = first.latitude, maxLat = first.latitude
+        var minLon = first.longitude, maxLon = first.longitude
+        for c in coordinates.dropFirst() {
+            minLat = min(minLat, c.latitude); maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude); maxLon = max(maxLon, c.longitude)
+        }
+        let center = CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLon + maxLon) / 2
+        )
+        let span = MKCoordinateSpan(
+            latitudeDelta: max((maxLat - minLat) * 1.3, 0.05),
+            longitudeDelta: max((maxLon - minLon) * 1.3, 0.05)
+        )
+        return MKCoordinateRegion(center: center, span: span)
     }
 
     var courseSidebar: some View {
