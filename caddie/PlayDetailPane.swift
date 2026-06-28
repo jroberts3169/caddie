@@ -10,6 +10,8 @@ import SwiftUI
 struct PlayDetailPane: View {
     let holes: [OSMHole]
     @Binding var currentHoleIndex: Int
+    let shots: [Shot]
+    let onClearShots: () -> Void
 
     private var currentHole: OSMHole? {
         guard holes.indices.contains(currentHoleIndex) else { return nil }
@@ -60,6 +62,10 @@ struct PlayDetailPane: View {
                     }
                 }
                 .padding(20)
+
+                Divider()
+
+                shotsSection
             } else {
                 ContentUnavailableView(
                     "No Hole Data",
@@ -72,6 +78,58 @@ struct PlayDetailPane: View {
             Spacer()
         }
         .inspectorColumnWidth(min: 220, ideal: 260, max: 320)
+    }
+
+    // MARK: - Shots
+
+    private var shotsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Shots")
+                    .font(.headline)
+                Spacer()
+                Text("\(shots.count)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+
+            if shots.isEmpty {
+                Text("Click the map to record a shot.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 12)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(Array(shots.enumerated()), id: \.element.id) { index, _ in
+                            HStack {
+                                Image(systemName: "\(index + 1).circle.fill")
+                                    .foregroundStyle(.orange)
+                                Text("Shot \(index + 1)")
+                                Spacer()
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 6)
+                        }
+                    }
+                }
+                .frame(maxHeight: 220)
+
+                Button(role: .destructive) {
+                    onClearShots()
+                } label: {
+                    Label("Clear All Shots", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+            }
+        }
     }
 
     // MARK: - Subviews

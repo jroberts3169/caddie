@@ -17,6 +17,24 @@ import SwiftUI
 
 // MARK: - Inputs
 
+/// A single recorded shot on a hole: just a map coordinate plus a stable id so
+/// SwiftUI lists and the map annotation set can diff it.
+struct Shot: Identifiable, Equatable {
+    let id: UUID
+    var coordinate: CLLocationCoordinate2D
+
+    init(id: UUID = UUID(), coordinate: CLLocationCoordinate2D) {
+        self.id = id
+        self.coordinate = coordinate
+    }
+
+    static func == (lhs: Shot, rhs: Shot) -> Bool {
+        lhs.id == rhs.id
+            && lhs.coordinate.latitude == rhs.coordinate.latitude
+            && lhs.coordinate.longitude == rhs.coordinate.longitude
+    }
+}
+
 /// A region the map should frame, tagged with an identity token so re-applying
 /// the *same* region (e.g. re-selecting a course) still takes effect. SwiftUI
 /// would otherwise diff two equal regions as "no change" and skip the update.
@@ -77,6 +95,12 @@ struct CourseMapView: NSViewRepresentable {
     var style: MapStyleConfig
     /// The region to frame, or `nil` to leave the camera where it is.
     var regionRequest: MapRegionRequest?
+    /// Recorded shots for the hole currently focused in Play mode.
+    var shots: [Shot]
+    /// Whether the map is in Play mode (clicking records a shot).
+    var isPlayMode: Bool
+    /// Called with the map coordinate of a click while in Play mode.
+    var onAddShot: (CLLocationCoordinate2D) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -99,11 +123,23 @@ struct CourseMapView: NSViewRepresentable {
         container.addSubview(map)
         context.coordinator.map = map
 
+        // Click-to-record-a-shot (gated to Play mode in the handler). A plain click
+        // recognizer fires reliably on a zero-movement click; MapKit's own pan still
+        // owns drags, so the map stays freely pannable.
+        let click = NSClickGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleMapClick(_:))
+        )
+        click.delegate = context.coordinator
+        map.addGestureRecognizer(click)
+
         return container
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         guard let map = context.coordinator.map else { return }
+        context.coordinator.onAddShot = onAddShot
+        context.coordinator.isPlayMode = isPlayMode
         context.coordinator.sync(
             map: map,
             outlines: outlines,
@@ -113,6 +149,7 @@ struct CourseMapView: NSViewRepresentable {
             courseMarkerCoordinate: courseMarkerCoordinate,
             nearbyCourses: nearbyCourses,
             style: style,
+            shots: shots,
             regionRequest: regionRequest
         )
     }
@@ -186,11 +223,25 @@ private final class HolePinAnnotation: NSObject, MKAnnotation {
     }
 }
 
+/// Numbered marker for a recorded shot on the active hole.
+private final class ShotAnnotation: NSObject, MKAnnotation {
+    @objc dynamic var coordinate: CLLocationCoordinate2D
+    let number: Int
+    init(coordinate: CLLocationCoordinate2D, number: Int) {
+        self.coordinate = coordinate
+        self.number = number
+    }
+}
+
 // MARK: - Coordinator
 
 extension CourseMapView {
-    final class Coordinator: NSObject, MKMapViewDelegate {
+    final class Coordinator: NSObject, MKMapViewDelegate, NSGestureRecognizerDelegate {
         weak var map: MKMapView?
+        /// Called with the clicked coordinate while in Play mode.
+        var onAddShot: ((CLLocationCoordinate2D) -> Void)?
+        /// Whether a click should record a shot.
+        var isPlayMode: Bool = false
 
         /// Hash of the inputs that determine the overlay set, so we only rebuild
         /// overlays (an expensive add/remove) when the geometry or style changes.
@@ -212,6 +263,7 @@ extension CourseMapView {
             courseMarkerCoordinate: CLLocationCoordinate2D?,
             nearbyCourses: [GolfCourse],
             style: MapStyleConfig,
+            shots: [Shot],
             regionRequest: MapRegionRequest?
         ) {
             syncOverlays(map: map, outlines: outlines, features: features, holes: holes, style: style)
@@ -221,9 +273,28 @@ extension CourseMapView {
                 displayedCourse: displayedCourse,
                 courseMarkerCoordinate: courseMarkerCoordinate,
                 nearbyCourses: nearbyCourses,
-                style: style
+                style: style,
+                shots: shots
             )
             applyRegion(map: map, regionRequest: regionRequest)
+        }
+
+        // MARK: Clicks
+
+        /// Records a shot at the clicked coordinate when in Play mode. Ignores
+        /// clicks that land on an existing annotation so tapping a marker doesn't
+        /// also drop a shot underneath it.
+        @objc func handleMapClick(_ gesture: NSClickGestureRecognizer) {
+            guard isPlayMode, let map else { return }
+            let point = gesture.location(in: map)
+            // Ignore clicks that land on an existing annotation glyph.
+            var view = map.hitTest(point)
+            while let current = view {
+                if current is MKAnnotationView { return }
+                view = current.superview
+            }
+            let coordinate = map.convert(point, toCoordinateFrom: map)
+            onAddShot?(coordinate)
         }
 
         // MARK: Overlays
@@ -350,7 +421,8 @@ extension CourseMapView {
             displayedCourse: GolfCourse?,
             courseMarkerCoordinate: CLLocationCoordinate2D?,
             nearbyCourses: [GolfCourse],
-            style: MapStyleConfig
+            style: MapStyleConfig,
+            shots: [Shot]
         ) {
             currentStyle = style
 
@@ -363,6 +435,11 @@ extension CourseMapView {
                 for course in nearbyCourses { hasher.combine(course.identifier) }
             }
             for h in holes { hasher.combine(h.osmIdentifier) }
+            for s in shots {
+                hasher.combine(s.id)
+                hasher.combine(s.coordinate.latitude)
+                hasher.combine(s.coordinate.longitude)
+            }
             hasher.combine(style.isVisible(.holes))
             // Fold in the holes color so a color-only Settings change rebuilds the
             // tee/pin annotations: their tint is baked in by `viewFor`, which MapKit
@@ -401,6 +478,10 @@ extension CourseMapView {
                             map.addAnnotation(HolePinAnnotation(coordinate: pin))
                         }
                     }
+                }
+                // Recorded shots for the active hole, numbered in tap order.
+                for (index, shot) in shots.enumerated() {
+                    map.addAnnotation(ShotAnnotation(coordinate: shot.coordinate, number: index + 1))
                 }
             } else {
                 for course in nearbyCourses {
@@ -456,6 +537,14 @@ extension CourseMapView {
                 layer.cornerRadius = size / 2
                 layer.backgroundColor = (currentStyle?.color(.holes) ?? .systemBlue).cgColor
                 view.layer = layer
+                return view
+
+            case let shot as ShotAnnotation:
+                let view = dequeueMarker(mapView, id: "shot", for: shot)
+                view.markerTintColor = .systemOrange
+                view.glyphText = "\(shot.number)"
+                view.displayPriority = .required
+                view.canShowCallout = false
                 return view
 
             default:

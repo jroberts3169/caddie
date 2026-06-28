@@ -231,6 +231,9 @@ struct ContentView: View {
     @State private var appMode: AppMode = .plan
     /// The hole currently focused in the Play detail pane.
     @State private var currentHoleIndex: Int = 0
+    /// Recorded shots keyed by hole OSM id, for the displayed course. Reset when a
+    /// new course is selected.
+    @State private var shotsByHole: [Int64: [Shot]] = [:]
 
     /// Radius for the "courses near me" search: 50 miles in meters.
     private static let nearbyRadiusMeters: CLLocationDistance = 80_467
@@ -246,7 +249,12 @@ struct ContentView: View {
                     get: { appMode == .play && displayedCourse != nil },
                     set: { if !$0 { appMode = .plan } }
                 )) {
-                    PlayDetailPane(holes: courseHoles, currentHoleIndex: $currentHoleIndex)
+                    PlayDetailPane(
+                        holes: courseHoles,
+                        currentHoleIndex: $currentHoleIndex,
+                        shots: currentHoleShots,
+                        onClearShots: clearCurrentHoleShots
+                    )
                 }
         }
         .navigationTitle(displayedCourse?.name ?? "Caddie")
@@ -284,6 +292,7 @@ struct ContentView: View {
             displayedSubCourses = []
             activeSubCourseID = nil
             currentHoleIndex = 0
+            shotsByHole = [:]
             // Stop any progressive overlay render still painting the previous course.
             featureRenderTask?.cancel()
             regionRequest = MapRegionRequest(region: MKCoordinateRegion(
@@ -388,6 +397,30 @@ struct ContentView: View {
         return subCourseLabel(sub)
     }
 
+    /// OSM id of the hole currently focused in the Play pane, or `nil` if none.
+    private var currentHoleID: Int64? {
+        guard courseHoles.indices.contains(currentHoleIndex) else { return nil }
+        return courseHoles[currentHoleIndex].osmIdentifier
+    }
+
+    /// Shots recorded on the currently focused hole.
+    private var currentHoleShots: [Shot] {
+        guard let id = currentHoleID else { return [] }
+        return shotsByHole[id] ?? []
+    }
+
+    /// Appends a shot at `coordinate` to the currently focused hole.
+    private func addShotToCurrentHole(_ coordinate: CLLocationCoordinate2D) {
+        guard let id = currentHoleID else { return }
+        shotsByHole[id, default: []].append(Shot(coordinate: coordinate))
+    }
+
+    /// Removes every shot on the currently focused hole.
+    private func clearCurrentHoleShots() {
+        guard let id = currentHoleID else { return }
+        shotsByHole[id] = nil
+    }
+
     private var courseMap: some View {
         CourseMapView(
             outlines: courseOutlines,
@@ -397,7 +430,10 @@ struct ContentView: View {
             courseMarkerCoordinate: markerCoordinate,
             nearbyCourses: nearbyCourses,
             style: mapStyleConfig,
-            regionRequest: regionRequest
+            regionRequest: regionRequest,
+            shots: currentHoleShots,
+            isPlayMode: appMode == .play && displayedCourse != nil,
+            onAddShot: addShotToCurrentHole
         )
         .ignoresSafeArea()
         .overlay(alignment: .center) {
