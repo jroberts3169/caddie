@@ -97,6 +97,8 @@ struct CourseMapView: NSViewRepresentable {
     var regionRequest: MapRegionRequest?
     /// Recorded shots for the hole currently focused in Play mode.
     var shots: [Shot]
+    /// The hole currently focused in Play mode.
+    var currentHole: OSMHole?
     /// Whether the map is in Play mode (clicking records a shot).
     var isPlayMode: Bool
     /// Called with the map coordinate of a click while in Play mode.
@@ -150,6 +152,7 @@ struct CourseMapView: NSViewRepresentable {
             nearbyCourses: nearbyCourses,
             style: style,
             shots: shots,
+            currentHole: currentHole,
             regionRequest: regionRequest
         )
     }
@@ -163,6 +166,7 @@ private enum OverlayRole: String {
     case boundary
     case feature
     case hole
+    case shot
 }
 
 /// `MKPolygon` that remembers which layer/role styles it. Subclassing lets the
@@ -233,6 +237,19 @@ private final class ShotAnnotation: NSObject, MKAnnotation {
     }
 }
 
+/// Small yardage pill anchored near a shot segment.
+private final class ShotYardageAnnotation: NSObject, MKAnnotation {
+    @objc dynamic var coordinate: CLLocationCoordinate2D
+    let label: String
+    let shotNumber: Int
+
+    init(coordinate: CLLocationCoordinate2D, label: String, shotNumber: Int) {
+        self.coordinate = coordinate
+        self.label = label
+        self.shotNumber = shotNumber
+    }
+}
+
 // MARK: - Coordinator
 
 extension CourseMapView {
@@ -264,9 +281,20 @@ extension CourseMapView {
             nearbyCourses: [GolfCourse],
             style: MapStyleConfig,
             shots: [Shot],
+            currentHole: OSMHole?,
             regionRequest: MapRegionRequest?
         ) {
-            syncOverlays(map: map, outlines: outlines, features: features, holes: holes, style: style)
+            let segments = shotSegments(shots: shots, currentHole: currentHole)
+            syncOverlays(
+                map: map,
+                outlines: outlines,
+                features: features,
+                holes: holes,
+                style: style,
+                shots: shots,
+                currentHole: currentHole,
+                segments: segments
+            )
             syncAnnotations(
                 map: map,
                 holes: holes,
@@ -274,7 +302,9 @@ extension CourseMapView {
                 courseMarkerCoordinate: courseMarkerCoordinate,
                 nearbyCourses: nearbyCourses,
                 style: style,
-                shots: shots
+                shots: shots,
+                currentHole: currentHole,
+                segments: segments
             )
             applyRegion(map: map, regionRequest: regionRequest)
         }
@@ -304,7 +334,10 @@ extension CourseMapView {
             outlines: [[CLLocationCoordinate2D]],
             features: [OSMFeature],
             holes: [OSMHole],
-            style: MapStyleConfig
+            style: MapStyleConfig,
+            shots: [Shot],
+            currentHole: OSMHole?,
+            segments: [ShotSegment]
         ) {
             var hasher = Hasher()
             for ring in outlines {
@@ -316,6 +349,16 @@ extension CourseMapView {
                 hasher.combine(f.isClosed)
             }
             for h in holes { hasher.combine(h.osmIdentifier) }
+            for s in shots {
+                hasher.combine(s.id)
+                hasher.combine(s.coordinate.latitude)
+                hasher.combine(s.coordinate.longitude)
+            }
+            hasher.combine(currentHole?.osmIdentifier)
+            if let tee = currentHole?.coordinates.first {
+                hasher.combine(tee.lat)
+                hasher.combine(tee.lon)
+            }
             // Style affects which overlays exist (visibility) and is cheap to fold in
             // so a Settings color/visibility change re-renders.
             for layer in OverlayLayer.allCases {
@@ -375,6 +418,14 @@ extension CourseMapView {
                     map.addOverlay(poly, level: .aboveLabels)
                 }
             }
+            // Shot segments sit above labels so they are always visible over terrain.
+            for segment in segments {
+                var coords = [segment.from, segment.to]
+                let line = StyledPolyline(coordinates: &coords, count: coords.count)
+                line.layer = .unknown
+                line.role = .shot
+                map.addOverlay(line, level: .aboveLabels)
+            }
             map.removeOverlays(old)
         }
 
@@ -398,7 +449,10 @@ extension CourseMapView {
                 let renderer = MKPolylineRenderer(polyline: line)
                 let color = currentStyle?.color(line.layer) ?? .white
                 renderer.strokeColor = color
-                if line.role == .hole {
+                if line.role == .shot {
+                    renderer.strokeColor = NSColor.systemOrange.withAlphaComponent(0.85)
+                    renderer.lineWidth = 3
+                } else if line.role == .hole {
                     renderer.lineWidth = 2
                     renderer.lineDashPattern = [6, 4]
                 } else {
@@ -422,7 +476,9 @@ extension CourseMapView {
             courseMarkerCoordinate: CLLocationCoordinate2D?,
             nearbyCourses: [GolfCourse],
             style: MapStyleConfig,
-            shots: [Shot]
+            shots: [Shot],
+            currentHole: OSMHole?,
+            segments: [ShotSegment]
         ) {
             currentStyle = style
 
@@ -439,6 +495,11 @@ extension CourseMapView {
                 hasher.combine(s.id)
                 hasher.combine(s.coordinate.latitude)
                 hasher.combine(s.coordinate.longitude)
+            }
+            hasher.combine(currentHole?.osmIdentifier)
+            if let tee = currentHole?.coordinates.first {
+                hasher.combine(tee.lat)
+                hasher.combine(tee.lon)
             }
             hasher.combine(style.isVisible(.holes))
             // Fold in the holes color so a color-only Settings change rebuilds the
@@ -482,6 +543,13 @@ extension CourseMapView {
                 // Recorded shots for the active hole, numbered in tap order.
                 for (index, shot) in shots.enumerated() {
                     map.addAnnotation(ShotAnnotation(coordinate: shot.coordinate, number: index + 1))
+                }
+                for segment in segments {
+                    map.addAnnotation(ShotYardageAnnotation(
+                        coordinate: segment.midpoint,
+                        label: "\(segment.yards)y",
+                        shotNumber: segment.shotNumber
+                    ))
                 }
             } else {
                 for course in nearbyCourses {
@@ -547,6 +615,37 @@ extension CourseMapView {
                 view.canShowCallout = false
                 return view
 
+            case let yardage as ShotYardageAnnotation:
+                let id = "shotYardage"
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: yardage, reuseIdentifier: id)
+                view.annotation = yardage
+                view.canShowCallout = false
+                view.displayPriority = .required
+                view.centerOffset = CGPoint(x: 0, y: -12)
+
+                let text = yardage.label
+                let pillSize = pillSizeForYardage(text)
+                let paraStyle = NSMutableParagraphStyle()
+                paraStyle.alignment = .center
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.white,
+                    .paragraphStyle: paraStyle
+                ]
+                // Drawing handler renders at the target context's scale factor,
+                // so the pill is sharp on Retina displays without manual scaling.
+                let image = NSImage(size: pillSize, flipped: false) { rect in
+                    let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+                    NSColor.black.withAlphaComponent(0.72).setFill()
+                    path.fill()
+                    let textRect = NSRect(x: 7, y: 3, width: rect.width - 14, height: rect.height - 6)
+                    text.draw(in: textRect, withAttributes: attrs)
+                    return true
+                }
+                view.image = image
+                return view
+
             default:
                 return nil
             }
@@ -563,15 +662,76 @@ extension CourseMapView {
             return view
         }
 
-        /// Compact hole label, e.g. "3 · Par 4 · 410y".
+        /// Compact hole label, e.g. "Par 4 · 410y". Falls back to the
+        /// coordinate-derived tee-to-pin distance when OSM lacks a length tag.
         private static func holeTitle(_ hole: OSMHole) -> String {
             var parts: [String] = []
-            // if let ref = hole.ref, !ref.isEmpty { parts.append(ref) }
             if let par = hole.par { parts.append("Par \(par)") }
-            if let meters = hole.lengthMeters {
+            let meters = hole.lengthMeters ?? teeToGreenMeters(hole)
+            if let meters {
                 parts.append("\(Int((meters * 1.09361).rounded()))y")
             }
             return parts.isEmpty ? "Hole" : parts.joined(separator: " · ")
+        }
+
+        /// Straight-line tee-to-pin distance in metres, derived from the hole's
+        /// first and last coordinates. Returns `nil` when fewer than 2 points exist.
+        private static func teeToGreenMeters(_ hole: OSMHole) -> Double? {
+            guard hole.coordinates.count >= 2,
+                  let tee = hole.coordinates.first,
+                  let pin = hole.coordinates.last else { return nil }
+            return CLLocation(latitude: tee.lat, longitude: tee.lon)
+                .distance(from: CLLocation(latitude: pin.lat, longitude: pin.lon))
+        }
+
+        private struct ShotSegment {
+            let shotNumber: Int
+            let from: CLLocationCoordinate2D
+            let to: CLLocationCoordinate2D
+            let midpoint: CLLocationCoordinate2D
+            let yards: Int
+        }
+
+        /// Creates one segment per recorded shot. Shot 1 starts at the hole tee
+        /// when available, then each following shot starts at the prior shot.
+        private func shotSegments(shots: [Shot], currentHole: OSMHole?) -> [ShotSegment] {
+            var segments: [ShotSegment] = []
+            var previous: CLLocationCoordinate2D?
+            if let tee = currentHole?.coordinates.first {
+                previous = CLLocationCoordinate2D(latitude: tee.lat, longitude: tee.lon)
+            }
+
+            for (index, shot) in shots.enumerated() {
+                guard let from = previous else {
+                    previous = shot.coordinate
+                    continue
+                }
+                let yards = Int((distanceMeters(from: from, to: shot.coordinate) * 1.09361).rounded())
+                let midpoint = CLLocationCoordinate2D(
+                    latitude: (from.latitude + shot.coordinate.latitude) / 2,
+                    longitude: (from.longitude + shot.coordinate.longitude) / 2
+                )
+                segments.append(ShotSegment(
+                    shotNumber: index + 1,
+                    from: from,
+                    to: shot.coordinate,
+                    midpoint: midpoint,
+                    yards: yards
+                ))
+                previous = shot.coordinate
+            }
+            return segments
+        }
+
+        private func distanceMeters(from: CLLocationCoordinate2D, to: CLLocationCoordinate2D) -> CLLocationDistance {
+            CLLocation(latitude: from.latitude, longitude: from.longitude)
+                .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
+        }
+
+        private func pillSizeForYardage(_ text: String) -> CGSize {
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]
+            let textSize = text.size(withAttributes: attrs)
+            return CGSize(width: max(34, ceil(textSize.width) + 14), height: 20)
         }
 
         // MARK: Region

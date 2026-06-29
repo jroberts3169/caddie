@@ -432,6 +432,7 @@ struct ContentView: View {
             style: mapStyleConfig,
             regionRequest: regionRequest,
             shots: currentHoleShots,
+            currentHole: courseHoles.indices.contains(currentHoleIndex) ? courseHoles[currentHoleIndex] : nil,
             isPlayMode: appMode == .play && displayedCourse != nil,
             onAddShot: addShotToCurrentHole
         )
