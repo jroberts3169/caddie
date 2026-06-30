@@ -13,6 +13,7 @@ struct PlayDetailPane: View {
     @Binding var currentHoleIndex: Int
     let shots: [Shot]
     let onClearShots: () -> Void
+    let onUndoShot: () -> Void
 
     private var currentHole: OSMHole? {
         guard holes.indices.contains(currentHoleIndex) else { return nil }
@@ -103,6 +104,13 @@ struct PlayDetailPane: View {
             Spacer()
         }
         .inspectorColumnWidth(min: 220, ideal: 260, max: 320)
+        .background {
+            // Hidden ⌘Z handler: undoes the last recorded shot on the focused hole.
+            Button("Undo Shot", action: onUndoShot)
+                .keyboardShortcut("z", modifiers: .command)
+                .disabled(shots.isEmpty)
+                .hidden()
+        }
     }
 
     // MARK: - Shots

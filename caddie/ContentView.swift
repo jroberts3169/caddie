@@ -253,7 +253,8 @@ struct ContentView: View {
                         holes: courseHoles,
                         currentHoleIndex: $currentHoleIndex,
                         shots: currentHoleShots,
-                        onClearShots: clearCurrentHoleShots
+                        onClearShots: clearCurrentHoleShots,
+                        onUndoShot: undoLastShot
                     )
                 }
         }
@@ -419,6 +420,14 @@ struct ContentView: View {
     private func clearCurrentHoleShots() {
         guard let id = currentHoleID else { return }
         shotsByHole[id] = nil
+    }
+
+    /// Removes the most recently recorded shot on the currently focused hole, e.g.
+    /// in response to cmd+z. No-op when the hole has no shots.
+    private func undoLastShot() {
+        guard let id = currentHoleID, var holeShots = shotsByHole[id], !holeShots.isEmpty else { return }
+        holeShots.removeLast()
+        shotsByHole[id] = holeShots.isEmpty ? nil : holeShots
     }
 
     /// Switches the Play focus to the hole with the given OSM id, e.g. when its
