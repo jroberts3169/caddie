@@ -5,6 +5,7 @@
 //  Created by Jeff Roberts on 6/28/26.
 //
 
+import CoreLocation
 import SwiftUI
 
 struct PlayDetailPane: View {
@@ -16,6 +17,30 @@ struct PlayDetailPane: View {
     private var currentHole: OSMHole? {
         guard holes.indices.contains(currentHoleIndex) else { return nil }
         return holes[currentHoleIndex]
+    }
+
+    /// Yardage for each shot, parallel to `shots`. Shot 1 is measured from the
+    /// hole tee (the hole's first coordinate) when available; every later shot is
+    /// measured from the previous shot. `nil` when there's no reference point yet
+    /// (e.g. shot 1 on a hole with no tee geometry). Mirrors the segment logic the
+    /// map uses to draw yardage pills so the two always agree.
+    private var shotYards: [Int?] {
+        var result: [Int?] = []
+        var previous: CLLocationCoordinate2D?
+        if let tee = currentHole?.coordinates.first {
+            previous = CLLocationCoordinate2D(latitude: tee.lat, longitude: tee.lon)
+        }
+        for shot in shots {
+            if let from = previous {
+                let meters = CLLocation(latitude: from.latitude, longitude: from.longitude)
+                    .distance(from: CLLocation(latitude: shot.coordinate.latitude, longitude: shot.coordinate.longitude))
+                result.append(Int((meters * 1.09361).rounded()))
+            } else {
+                result.append(nil)
+            }
+            previous = shot.coordinate
+        }
+        return result
     }
 
     var body: some View {
@@ -106,12 +131,19 @@ struct PlayDetailPane: View {
             } else {
                 ScrollView {
                     VStack(spacing: 0) {
+                        let yards = shotYards
                         ForEach(Array(shots.enumerated()), id: \.element.id) { index, _ in
                             HStack {
                                 Image(systemName: "\(index + 1).circle.fill")
                                     .foregroundStyle(.orange)
                                 Text("Shot \(index + 1)")
                                 Spacer()
+                                if let yardage = yards[index] {
+                                    Text("\(yardage) yd")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                }
                             }
                             .padding(.horizontal, 20)
                             .padding(.vertical, 6)

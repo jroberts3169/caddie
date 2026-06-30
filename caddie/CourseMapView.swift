@@ -103,6 +103,8 @@ struct CourseMapView: NSViewRepresentable {
     var isPlayMode: Bool
     /// Called with the map coordinate of a click while in Play mode.
     var onAddShot: (CLLocationCoordinate2D) -> Void
+    /// Called with a hole's OSM id when its tee marker is tapped in Play mode.
+    var onSelectHole: (Int64) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -141,6 +143,7 @@ struct CourseMapView: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         guard let map = context.coordinator.map else { return }
         context.coordinator.onAddShot = onAddShot
+        context.coordinator.onSelectHole = onSelectHole
         context.coordinator.isPlayMode = isPlayMode
         context.coordinator.sync(
             map: map,
@@ -210,10 +213,12 @@ private final class NearbyCourseAnnotation: NSObject, MKAnnotation {
 /// Numbered marker at a hole's tee, carrying par/length detail in its callout.
 private final class HoleTeeAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
+    let osmIdentifier: Int64
     let glyph: String
     let title: String?
-    init(coordinate: CLLocationCoordinate2D, glyph: String, title: String?) {
+    init(coordinate: CLLocationCoordinate2D, osmIdentifier: Int64, glyph: String, title: String?) {
         self.coordinate = coordinate
+        self.osmIdentifier = osmIdentifier
         self.glyph = glyph
         self.title = title
     }
@@ -257,6 +262,8 @@ extension CourseMapView {
         weak var map: MKMapView?
         /// Called with the clicked coordinate while in Play mode.
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
+        /// Called with a tapped tee's hole OSM id while in Play mode.
+        var onSelectHole: ((Int64) -> Void)?
         /// Whether a click should record a shot.
         var isPlayMode: Bool = false
 
@@ -313,20 +320,50 @@ extension CourseMapView {
 
         // MARK: Clicks
 
-        /// Records a shot at the clicked coordinate when in Play mode. Ignores
-        /// clicks that land on an existing annotation so tapping a marker doesn't
-        /// also drop a shot underneath it.
+        /// Handles a Play-mode click: a click on a hole's tee marker switches focus
+        /// to that hole; otherwise the click records a shot. `map.hitTest` is
+        /// unreliable for `MKMarkerAnnotationView` (its balloon is drawn above the
+        /// coordinate anchor, so the view's frame doesn't line up with the visible
+        /// glyph), so the tee glyphs are hit-tested geometrically: each tee's
+        /// coordinate is projected to its on-screen tip and a balloon-shaped rect is
+        /// anchored there. The nearest tee whose balloon contains the click wins.
         @objc func handleMapClick(_ gesture: NSClickGestureRecognizer) {
             guard isPlayMode, let map else { return }
             let point = gesture.location(in: map)
-            // Ignore clicks that land on an existing annotation glyph.
+
+            if let tee = nearestTee(to: point, in: map) {
+                onSelectHole?(tee.osmIdentifier)
+                return
+            }
+            // Clicks landing on any other annotation glyph (course pin, shot marker)
+            // shouldn't also drop a shot underneath it.
             var view = map.hitTest(point)
             while let current = view {
                 if current is MKAnnotationView { return }
                 view = current.superview
             }
+
             let coordinate = map.convert(point, toCoordinateFrom: map)
             onAddShot?(coordinate)
+        }
+
+        /// The tee annotation whose balloon glyph contains `point`, or `nil` if the
+        /// click missed every tee. When balloons overlap, the one whose tip is
+        /// nearest the click wins (not the first in iteration order).
+        private func nearestTee(to point: CGPoint, in map: MKMapView) -> HoleTeeAnnotation? {
+            var best: (tee: HoleTeeAnnotation, distance: CGFloat)?
+            for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
+                let tip = map.convert(tee.coordinate, toPointTo: map)
+                // Balloon rises up from the coordinate tip: ~48pt wide, ~60pt tall.
+                let balloon = CGRect(x: tip.x - 24, y: tip.y - 56, width: 48, height: 60)
+                guard balloon.contains(point) else { continue }
+                let dx = point.x - tip.x, dy = point.y - tip.y
+                let distance = (dx * dx + dy * dy).squareRoot()
+                if best == nil || distance < best!.distance {
+                    best = (tee, distance)
+                }
+            }
+            return best?.tee
         }
 
         // MARK: Overlays
@@ -549,6 +586,7 @@ extension CourseMapView {
                         if let tee = coords.first {
                             map.addAnnotation(HoleTeeAnnotation(
                                 coordinate: tee,
+                                osmIdentifier: hole.osmIdentifier,
                                 glyph: hole.ref ?? "",
                                 title: Self.holeTitle(hole)
                             ))

@@ -421,6 +421,13 @@ struct ContentView: View {
         shotsByHole[id] = nil
     }
 
+    /// Switches the Play focus to the hole with the given OSM id, e.g. when its
+    /// tee marker is tapped on the map.
+    private func selectHole(withID id: Int64) {
+        guard let index = courseHoles.firstIndex(where: { $0.osmIdentifier == id }) else { return }
+        currentHoleIndex = index
+    }
+
     private var courseMap: some View {
         CourseMapView(
             outlines: courseOutlines,
@@ -434,7 +441,8 @@ struct ContentView: View {
             shots: currentHoleShots,
             currentHole: courseHoles.indices.contains(currentHoleIndex) ? courseHoles[currentHoleIndex] : nil,
             isPlayMode: appMode == .play && displayedCourse != nil,
-            onAddShot: addShotToCurrentHole
+            onAddShot: addShotToCurrentHole,
+            onSelectHole: selectHole(withID:)
         )
         .ignoresSafeArea()
         .overlay(alignment: .center) {
