@@ -263,8 +263,11 @@ extension CourseMapView {
         /// Hash of the inputs that determine the overlay set, so we only rebuild
         /// overlays (an expensive add/remove) when the geometry or style changes.
         private var appliedOverlayHash: Int?
-        /// Hash of the inputs that determine the annotation set.
-        private var appliedAnnotationHash: Int?
+        /// Hash of the inputs that determine the static annotation set (course
+        /// marker, hole tees/pins, nearby flags) — everything except shots.
+        private var appliedStaticAnnotationHash: Int?
+        /// Hash of the inputs that determine the shot annotation set.
+        private var appliedShotAnnotationHash: Int?
         /// Identity of the last applied region request, so the same region can be
         /// re-framed but an unchanged one isn't reapplied every update pass.
         private var appliedRegionID: UUID?
@@ -303,7 +306,6 @@ extension CourseMapView {
                 nearbyCourses: nearbyCourses,
                 style: style,
                 shots: shots,
-                currentHole: currentHole,
                 segments: segments
             )
             applyRegion(map: map, regionRequest: regionRequest)
@@ -477,11 +479,34 @@ extension CourseMapView {
             nearbyCourses: [GolfCourse],
             style: MapStyleConfig,
             shots: [Shot],
-            currentHole: OSMHole?,
             segments: [ShotSegment]
         ) {
             currentStyle = style
+            syncStaticAnnotations(
+                map: map,
+                holes: holes,
+                displayedCourse: displayedCourse,
+                courseMarkerCoordinate: courseMarkerCoordinate,
+                nearbyCourses: nearbyCourses,
+                style: style
+            )
+            syncShotAnnotations(map: map, shots: shots, segments: segments)
+        }
 
+        /// Rebuilds the course marker, hole tees/pins, and nearby flags. This set
+        /// changes only on course selection / nearby load / holes style change —
+        /// never when a shot is recorded — so dropping a shot no longer tears down
+        /// and recycles every tee/pin glyph (MapKit recycles the view during removal
+        /// and hands back a stale cached image for one frame, which read as a flash).
+        /// Gated on its own hash so an unrelated update is a no-op.
+        private func syncStaticAnnotations(
+            map: MKMapView,
+            holes: [OSMHole],
+            displayedCourse: GolfCourse?,
+            courseMarkerCoordinate: CLLocationCoordinate2D?,
+            nearbyCourses: [GolfCourse],
+            style: MapStyleConfig
+        ) {
             var hasher = Hasher()
             if let course = displayedCourse {
                 hasher.combine(course.identifier)
@@ -491,16 +516,6 @@ extension CourseMapView {
                 for course in nearbyCourses { hasher.combine(course.identifier) }
             }
             for h in holes { hasher.combine(h.osmIdentifier) }
-            for s in shots {
-                hasher.combine(s.id)
-                hasher.combine(s.coordinate.latitude)
-                hasher.combine(s.coordinate.longitude)
-            }
-            hasher.combine(currentHole?.osmIdentifier)
-            if let tee = currentHole?.coordinates.first {
-                hasher.combine(tee.lat)
-                hasher.combine(tee.lon)
-            }
             hasher.combine(style.isVisible(.holes))
             // Fold in the holes color so a color-only Settings change rebuilds the
             // tee/pin annotations: their tint is baked in by `viewFor`, which MapKit
@@ -512,14 +527,17 @@ extension CourseMapView {
                 hasher.combine(c.alphaComponent)
             }
             let hash = hasher.finalize()
-            guard hash != appliedAnnotationHash else { return }
-            appliedAnnotationHash = hash
+            guard hash != appliedStaticAnnotationHash else { return }
+            appliedStaticAnnotationHash = hash
 
-            // Drop every annotation except the user-location dot, then rebuild. These
-            // sets change only on course selection / nearby load, never per frame, so
-            // a discrete rebuild here doesn't reintroduce the per-frame jitter that
-            // motivated the move to a native map.
-            let toRemove = map.annotations.filter { !($0 is MKUserLocation) }
+            // Remove only the static glyphs (leave the user-location dot and any
+            // shot/yardage annotations in place), then rebuild them.
+            let toRemove = map.annotations.filter {
+                $0 is CourseMarkerAnnotation
+                    || $0 is HoleTeeAnnotation
+                    || $0 is HolePinAnnotation
+                    || $0 is NearbyCourseAnnotation
+            }
             map.removeAnnotations(toRemove)
 
             if let course = displayedCourse {
@@ -540,17 +558,6 @@ extension CourseMapView {
                         }
                     }
                 }
-                // Recorded shots for the active hole, numbered in tap order.
-                for (index, shot) in shots.enumerated() {
-                    map.addAnnotation(ShotAnnotation(coordinate: shot.coordinate, number: index + 1))
-                }
-                for segment in segments {
-                    map.addAnnotation(ShotYardageAnnotation(
-                        coordinate: segment.midpoint,
-                        label: "\(segment.yards)y",
-                        shotNumber: segment.shotNumber
-                    ))
-                }
             } else {
                 for course in nearbyCourses {
                     map.addAnnotation(NearbyCourseAnnotation(
@@ -560,6 +567,77 @@ extension CourseMapView {
                     ))
                 }
             }
+        }
+
+        /// Reconciles the recorded-shot markers and yardage pills incrementally:
+        /// matching annotations are left untouched (no recycle, no flash); only
+        /// genuinely new shot/segment annotations are inserted and stale ones
+        /// removed. So recording a shot adds one marker without redrawing the
+        /// markers already on screen — and never touches the tees/pins/course pin.
+        private func syncShotAnnotations(
+            map: MKMapView,
+            shots: [Shot],
+            segments: [ShotSegment]
+        ) {
+            var hasher = Hasher()
+            for s in shots {
+                hasher.combine(s.id)
+                hasher.combine(s.coordinate.latitude)
+                hasher.combine(s.coordinate.longitude)
+            }
+            for seg in segments {
+                hasher.combine(seg.shotNumber)
+                hasher.combine(seg.yards)
+            }
+            let hash = hasher.finalize()
+            guard hash != appliedShotAnnotationHash else { return }
+            appliedShotAnnotationHash = hash
+
+            // Reconcile shot markers by number. Existing markers whose coordinate
+            // still matches are kept as-is; only genuinely new shots are added and
+            // stale ones removed.
+            var shotByNumber: [Int: ShotAnnotation] = [:]
+            for shot in map.annotations.compactMap({ $0 as? ShotAnnotation }) {
+                shotByNumber[shot.number] = shot
+            }
+            var addShots: [ShotAnnotation] = []
+            for (index, shot) in shots.enumerated() {
+                let number = index + 1
+                if let existing = shotByNumber[number],
+                   existing.coordinate.latitude == shot.coordinate.latitude,
+                   existing.coordinate.longitude == shot.coordinate.longitude {
+                    shotByNumber[number] = nil
+                } else {
+                    addShots.append(ShotAnnotation(coordinate: shot.coordinate, number: number))
+                }
+            }
+            let removeShots = Array(shotByNumber.values)
+
+            // Same reconcile for the yardage pills, keyed by their shot number.
+            var yardageByNumber: [Int: ShotYardageAnnotation] = [:]
+            for yardage in map.annotations.compactMap({ $0 as? ShotYardageAnnotation }) {
+                yardageByNumber[yardage.shotNumber] = yardage
+            }
+            var addYardage: [ShotYardageAnnotation] = []
+            for segment in segments {
+                let label = "\(segment.yards)y"
+                if let existing = yardageByNumber[segment.shotNumber],
+                   existing.label == label,
+                   existing.coordinate.latitude == segment.midpoint.latitude,
+                   existing.coordinate.longitude == segment.midpoint.longitude {
+                    yardageByNumber[segment.shotNumber] = nil
+                } else {
+                    addYardage.append(ShotYardageAnnotation(
+                        coordinate: segment.midpoint,
+                        label: label,
+                        shotNumber: segment.shotNumber
+                    ))
+                }
+            }
+            let removeYardage = Array(yardageByNumber.values)
+
+            map.removeAnnotations(removeShots + removeYardage)
+            map.addAnnotations(addShots + addYardage)
         }
 
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
