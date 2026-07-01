@@ -21,6 +21,13 @@ with the pattern
 - Write rules for yourself that prevent the same mistake
 - Ruthlessly iterate on these lessons until mistake rate drops
 - Review lessons at session start for relevant project
+- **Persist durable lessons to memory**: when a bug, fix, or gotcha is
+  non-obvious and likely to recur (especially SwiftUI/AppKit/MapKit platform
+  quirks), write a concise entry to the appropriate memory file (e.g.
+  `/memories/swiftui.md`) in addition to `tasks/lessons.md`. Do this whenever a
+  fix corrects a mistake I made, whenever the user says an implementation is
+  wrong, or whenever the root cause was surprising. Keep entries one-bullet,
+  problem→wrong-attempt→fix.
 
 ### 4. Verification Before Done
 

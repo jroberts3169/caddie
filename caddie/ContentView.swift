@@ -234,6 +234,9 @@ struct ContentView: View {
     /// Recorded shots keyed by hole OSM id, for the displayed course. Reset when a
     /// new course is selected.
     @State private var shotsByHole: [Int64: [Shot]] = [:]
+    /// Region the user has panned/zoomed to on the nearby map but not yet searched;
+    /// non-nil drives the "Search here" button. Cleared once a search runs.
+    @State private var pendingSearchRegion: MKCoordinateRegion?
 
     /// Radius for the "courses near me" search: 50 miles in meters.
     private static let nearbyRadiusMeters: CLLocationDistance = 80_467
@@ -294,6 +297,7 @@ struct ContentView: View {
             activeSubCourseID = nil
             currentHoleIndex = 0
             shotsByHole = [:]
+            pendingSearchRegion = nil
             // Stop any progressive overlay render still painting the previous course.
             featureRenderTask?.cancel()
             regionRequest = MapRegionRequest(region: MKCoordinateRegion(
@@ -451,12 +455,45 @@ struct ContentView: View {
             currentHole: courseHoles.indices.contains(currentHoleIndex) ? courseHoles[currentHoleIndex] : nil,
             isPlayMode: appMode == .play && displayedCourse != nil,
             onAddShot: addShotToCurrentHole,
-            onSelectHole: selectHole(withID:)
+            onSelectHole: selectHole(withID:),
+            onCameraMoved: { region in
+                // Offer a re-search only while browsing the nearby map (no course
+                // open) — panning around an opened course shouldn't prompt it.
+                guard displayedCourse == nil else { return }
+                pendingSearchRegion = region
+            }
         )
         .ignoresSafeArea()
+        .overlay(alignment: .bottom) {
+            searchHereButton
+        }
         .overlay(alignment: .center) {
             loadingBanner
         }
+    }
+
+    /// "Search this area" pill shown near the top of the nearby map after the user
+    /// pans or zooms, so results can be refreshed for the region now in view.
+    /// Rendered unconditionally and driven by opacity so its subtree is never
+    /// inserted/removed adjacent to the Map view.
+    private var searchHereButton: some View {
+        let region = pendingSearchRegion
+        return Button {
+            if let region { Task { await searchHere(in: region) } }
+        } label: {
+            Label("Search this area", systemImage: "arrow.trianglehead.clockwise")
+                .font(.callout.weight(.medium))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+        }
+        .buttonStyle(.plain)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.separator))
+        .shadow(radius: 4, y: 2)
+        .padding(.top, 12)
+        .opacity(region != nil ? 1 : 0)
+        .animation(.easeInOut(duration: 0.2), value: region != nil)
+        .allowsHitTesting(region != nil)
     }
 
     /// Flattens the `@Observable` `OverlaySettings` into a value-type snapshot the
@@ -922,6 +959,32 @@ struct ContentView: View {
         // Frame everything: all course markers plus the user's own location.
         guard displayedCourse == nil else { return }
         regionRequest = MapRegionRequest(region: regionFitting(courses.map(\.coordinate) + [center]))
+    }
+
+    /// Re-runs the golf-course search over the region the user has panned/zoomed
+    /// to, replacing the nearby markers with what's in view. Unlike the initial
+    /// search it does *not* re-frame the camera — the user is already looking at
+    /// the area they want — and it uses the visible span (not the fixed 50-mile
+    /// radius) so results match what's on screen.
+    private func searchHere(in region: MKCoordinateRegion) async {
+        pendingSearchRegion = nil
+
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = "golf course"
+        request.resultTypes = [.pointOfInterest]
+        request.pointOfInterestFilter = MKPointOfInterestFilter(including: [.golf])
+        request.region = region
+
+        let search = MKLocalSearch(request: request)
+        guard let response = try? await search.start() else { return }
+
+        let origin = CLLocation(latitude: region.center.latitude, longitude: region.center.longitude)
+        nearbyCourses = response.mapItems
+            .map(golfCourse(from:))
+            .sorted {
+                origin.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude))
+                    < origin.distance(from: CLLocation(latitude: $1.latitude, longitude: $1.longitude))
+            }
     }
 
     /// Builds an `MKCoordinateRegion` that encloses every coordinate with a little

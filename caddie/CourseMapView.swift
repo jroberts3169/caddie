@@ -105,6 +105,9 @@ struct CourseMapView: NSViewRepresentable {
     var onAddShot: (CLLocationCoordinate2D) -> Void
     /// Called with a hole's OSM id when its tee marker is tapped in Play mode.
     var onSelectHole: (Int64) -> Void
+    /// Called with the new region after the user pans/zooms the map (not fired for
+    /// programmatic camera moves), so a "Search here" affordance can be offered.
+    var onCameraMoved: (MKCoordinateRegion) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -144,6 +147,7 @@ struct CourseMapView: NSViewRepresentable {
         guard let map = context.coordinator.map else { return }
         context.coordinator.onAddShot = onAddShot
         context.coordinator.onSelectHole = onSelectHole
+        context.coordinator.onCameraMoved = onCameraMoved
         context.coordinator.isPlayMode = isPlayMode
         context.coordinator.sync(
             map: map,
@@ -264,6 +268,8 @@ extension CourseMapView {
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
         /// Called with a tapped tee's hole OSM id while in Play mode.
         var onSelectHole: ((Int64) -> Void)?
+        /// Called with the new region after a user-initiated pan/zoom.
+        var onCameraMoved: ((MKCoordinateRegion) -> Void)?
         /// Whether a click should record a shot.
         var isPlayMode: Bool = false
 
@@ -278,6 +284,13 @@ extension CourseMapView {
         /// Identity of the last applied region request, so the same region can be
         /// re-framed but an unchanged one isn't reapplied every update pass.
         private var appliedRegionID: UUID?
+        /// True while we're driving a programmatic `setRegion`, so the resulting
+        /// `regionDidChangeAnimated` callback can be told apart from a user pan/zoom.
+        private var isApplyingRegion = false
+        /// Whether we've framed the map at least once. MapKit fires a region change
+        /// as it settles its initial region on launch; suppressing reports until
+        /// after our first framing keeps that from popping the "Search here" button.
+        private var hasFramedOnce = false
 
         // MARK: Sync entry point
 
@@ -466,6 +479,23 @@ extension CourseMapView {
                 map.addOverlay(line, level: .aboveLabels)
             }
             map.removeOverlays(old)
+        }
+
+        // MARK: Delegate
+
+        /// Reports user-initiated pan/zoom so the map host can offer a "Search
+        /// here" affordance. Our own programmatic camera moves (course framing,
+        /// "Search here" itself) set `isApplyingRegion` around `setRegion`, so the
+        /// resulting callback is recognized as ours and filtered out — everything
+        /// else is the user dragging or zooming.
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            if isApplyingRegion {
+                isApplyingRegion = false
+                hasFramedOnce = true
+                return
+            }
+            guard hasFramedOnce else { return }
+            onCameraMoved?(mapView.region)
         }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
@@ -861,6 +891,9 @@ extension CourseMapView {
             let to = request.region.center
             let jump = CLLocation(latitude: from.latitude, longitude: from.longitude)
                 .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
+            // Mark this as our own move so the ensuing regionDidChange isn't
+            // mistaken for a user pan/zoom (which would pop the "Search here" button).
+            isApplyingRegion = true
             map.setRegion(request.region, animated: jump < 5_000)
         }
     }
