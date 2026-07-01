@@ -130,12 +130,17 @@ final class OSMCourseData {
     var encodedCourse: Data?
     var fetchedAt: Date
     var fetchStatus: String
+    /// The `currentBuilderVersion` in effect when this row was written. Defaults to
+    /// `0` so rows persisted before versioning existed migrate as "pre-v1" and are
+    /// refetched once. New/refreshed rows are stamped with the current version.
+    var builderVersion: Int = 0
 
-    init(courseIdentifier: String, encodedCourse: Data? = nil, fetchedAt: Date = .now, fetchStatus: String = "pending") {
+    init(courseIdentifier: String, encodedCourse: Data? = nil, fetchedAt: Date = .now, fetchStatus: String = "pending", builderVersion: Int = 0) {
         self.courseIdentifier = courseIdentifier
         self.encodedCourse = encodedCourse
         self.fetchedAt = fetchedAt
         self.fetchStatus = fetchStatus
+        self.builderVersion = builderVersion
     }
 }
 
@@ -156,6 +161,14 @@ enum SidebarSelection: Hashable {
 /// a working set (recents + a few comparisons) while bounding worst-case memory at
 /// ~16 decoded courses (tens of MB). Tunable here in one place.
 private let osmCacheCapacity = 16
+
+/// Version of the OSM course-building logic (`OSMCourseBuilder.makeCourse`). Bump
+/// this whenever a change alters the SHAPE of a built `OSMCourse` (sub-course
+/// splitting, hole parsing, feature attribution) so persisted blobs produced by an
+/// older builder are treated as stale and refetched, rather than served forever
+/// within the 30-day success TTL. History:
+///   1 — ref-embedded nine-name sub-courses + numeric hole-ref parsing (Steele Canyon).
+private let currentBuilderVersion = 1
 
 enum AppMode: String, CaseIterable {
     case plan = "Plan"
@@ -809,8 +822,8 @@ struct ContentView: View {
         // ("1, 10, 11 … 2 …"), which would make hole navigation jump 1→10 until the
         // course is refetched. Sorting at display time fixes those immediately.
         return holes.sorted { lhs, rhs in
-            let l = lhs.ref.flatMap { Int($0) } ?? Int.max
-            let r = rhs.ref.flatMap { Int($0) } ?? Int.max
+            let l = lhs.holeNumber ?? Int.max
+            let r = rhs.holeNumber ?? Int.max
             if l != r { return l < r }
             return (lhs.ref ?? "") < (rhs.ref ?? "")
         }
@@ -928,7 +941,7 @@ struct ContentView: View {
             let age = Date().timeIntervalSince(existing.fetchedAt)
             osmLog("cache row found status=\(existing.fetchStatus) age=\(Int(age))s")
             switch existing.fetchStatus {
-            case "ok" where age < successTTL:
+            case "ok" where age < successTTL && existing.builderVersion >= currentBuilderVersion:
                 osmLog("cache hit (ok), skipping fetch")
                 return
             case "notFound" where age < notFoundTTL:
@@ -1028,12 +1041,14 @@ struct ContentView: View {
             existing.encodedCourse = encoded
             existing.fetchedAt = .now
             existing.fetchStatus = status
+            existing.builderVersion = currentBuilderVersion
         } else {
             modelContext.insert(OSMCourseData(
                 courseIdentifier: courseIdentifier,
                 encodedCourse: encoded,
                 fetchedAt: .now,
-                fetchStatus: status
+                fetchStatus: status,
+                builderVersion: currentBuilderVersion
             ))
         }
     }

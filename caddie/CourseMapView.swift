@@ -257,6 +257,9 @@ private final class StyledPolygon: MKPolygon {
 private final class StyledPolyline: MKPolyline {
     var layer: OverlayLayer = .unknown
     var role: OverlayRole = .feature
+    /// For `.hole` centerlines, the owning hole's OSM id, so the renderer can dim
+    /// every non-focused hole to match the tee/pin/label emphasis in Play mode.
+    var osmIdentifier: Int64?
 }
 
 // MARK: - Annotations
@@ -585,6 +588,7 @@ extension CourseMapView {
                     let line = StyledPolyline(coordinates: coords, count: coords.count)
                     line.layer = .holes
                     line.role = .hole
+                    line.osmIdentifier = hole.osmIdentifier
                     map.addOverlay(line, level: .aboveLabels)
                 }
             }
@@ -663,6 +667,9 @@ extension CourseMapView {
                 } else if line.role == .hole {
                     renderer.lineWidth = 2
                     renderer.lineDashPattern = [6, 4]
+                    if let id = line.osmIdentifier {
+                        renderer.strokeColor = color.withAlphaComponent(emphasisAlpha(for: id))
+                    }
                 } else {
                     renderer.lineWidth = 2
                 }
@@ -757,7 +764,7 @@ extension CourseMapView {
                             map.addAnnotation(HoleTeeAnnotation(
                                 coordinate: tee,
                                 osmIdentifier: hole.osmIdentifier,
-                                glyph: hole.ref ?? "",
+                                glyph: hole.displayGlyph,
                                 title: Self.holeTitle(hole)
                             ))
                             map.addAnnotation(HoleTitleAnnotation(
@@ -1042,6 +1049,17 @@ extension CourseMapView {
                         view.animator().alphaValue = target
                     }
                 }
+            }
+            // The dotted hole centerlines dim the same way, but overlay renderers
+            // aren't part of the AppKit animation graph — re-stroke each cached hole
+            // renderer with the new emphasis alpha and mark it for redraw.
+            for overlay in map.overlays {
+                guard let line = overlay as? StyledPolyline, line.role == .hole,
+                      let id = line.osmIdentifier,
+                      let renderer = map.renderer(for: overlay) as? MKPolylineRenderer else { continue }
+                let color = currentStyle?.color(line.layer) ?? .white
+                renderer.strokeColor = color.withAlphaComponent(emphasisAlpha(for: id))
+                renderer.setNeedsDisplay()
             }
         }
 

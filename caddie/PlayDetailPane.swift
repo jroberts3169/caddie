@@ -168,6 +168,9 @@ struct PlayDetailPane: View {
 
     private var holeTitle: String {
         guard !holes.isEmpty else { return "No Holes" }
+        if let number = currentHole?.holeNumber {
+            return "Hole \(number)"
+        }
         if let ref = currentHole?.ref, !ref.isEmpty {
             return "Hole \(ref)"
         }
