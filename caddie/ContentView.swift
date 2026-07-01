@@ -197,10 +197,15 @@ struct ContentView: View {
     /// The sub-course currently shown, or `nil` when the displayed course is a single
     /// course (or, transiently, before its OSM data has loaded).
     @State private var activeSubCourseID: String?
-    /// The region the map should frame. Tagged with an identity token so
-    /// re-selecting the same course re-frames it (an equal region would otherwise
-    /// be diffed as "no change"). `nil` until the first frame request.
-    @State private var regionRequest: MapRegionRequest?
+    /// The framing the map should apply (top-down course region or a tilted
+    /// per-hole camera). Tagged with an identity token so re-selecting the same
+    /// course re-frames it (an equal value would otherwise be diffed as "no
+    /// change"). `nil` until the first frame request.
+    @State private var framingRequest: MapFramingRequest?
+    /// The course whose real footprint we have already top-down framed, so the
+    /// coarse selection frame is upgraded to a footprint frame exactly once (when
+    /// geometry first loads) rather than on every cached/network redraw.
+    @State private var framedFootprintCourseID: String?
     /// Cancellable handle for the progressive feature renderer (see `renderChunked`),
     /// so a new selection can stop a paint that is still in progress.
     @State private var featureRenderTask: Task<Void, Never>?
@@ -298,13 +303,16 @@ struct ContentView: View {
             currentHoleIndex = 0
             shotsByHole = [:]
             pendingSearchRegion = nil
+            framedFootprintCourseID = nil
             // Stop any progressive overlay render still painting the previous course.
             featureRenderTask?.cancel()
-            regionRequest = MapRegionRequest(region: MKCoordinateRegion(
+            // A coarse top-down frame for instant feedback (and to cover a far,
+            // cross-country jump); upgraded to the real footprint once geometry loads.
+            framingRequest = MapFramingRequest(framing: .topDown(MKCoordinateRegion(
                 center: course.coordinate,
                 latitudinalMeters: 2000,
                 longitudinalMeters: 2000
-            ))
+            )))
             recordRecent(course)
             // Cancel any in-flight fetch for a course the user has already moved past
             // so the new selection doesn't have to compete with it for the same
@@ -324,8 +332,47 @@ struct ContentView: View {
             // Switching sub-course (from the sidebar or the on-map picker) re-filters
             // the boundary, holes and features to the newly active course.
             guard let course = displayedCourse, let osmCourse = osmCache[course.identifier] else { return }
+            // "All" merges every sub-course's holes, and sub-courses share hole
+            // numbers (Balboa's Championship + Executive both run 1–9), so hole-by-hole
+            // play over the merged set shows each low number twice. Play mode therefore
+            // requires a concrete sub-course: if it's cleared to "All" here, snap to the
+            // largest so navigation stays 1…N with no duplicates.
+            if appMode == .play, activeSubCourseID == nil, displayedSubCourses.count > 1 {
+                activeSubCourseID = displayedSubCourses.first?.id
+                return
+            }
             applyOutline(from: osmCourse, for: course)
             applyFeatures(from: osmCourse, for: course)
+            if appMode == .play {
+                // The active sub-course changed the hole set; keep the index in range
+                // and re-frame the (possibly different) current hole.
+                currentHoleIndex = min(currentHoleIndex, max(0, courseHoles.count - 1))
+                frameCurrentHole()
+            }
+        }
+        .onChange(of: appMode) {
+            // Entering Play mode drops into the current hole's tilted camera; leaving
+            // it returns to the top-down course footprint.
+            guard let course = displayedCourse else { return }
+            if appMode == .play {
+                // On a multi-course facility "All" is a Plan-mode overview only; scope
+                // Play to the largest sub-course so its holes don't collide with a
+                // sibling course's identical hole numbers.
+                if activeSubCourseID == nil, displayedSubCourses.count > 1 {
+                    currentHoleIndex = 0
+                    activeSubCourseID = displayedSubCourses.first?.id
+                    // Framing happens once the sub-course change refreshes courseHoles.
+                } else {
+                    frameCurrentHole()
+                }
+            } else {
+                frameCourseFootprint(for: course)
+            }
+        }
+        .onChange(of: currentHoleIndex) {
+            // Navigating holes in Play mode swings the camera to the new hole's
+            // tee→pin heading.
+            frameCurrentHole()
         }
         .task {
             // Resolve the person's location once, find golf courses within 50 miles,
@@ -455,7 +502,7 @@ struct ContentView: View {
             courseMarkerCoordinate: markerCoordinate,
             nearbyCourses: nearbyCourses,
             style: mapStyleConfig,
-            regionRequest: regionRequest,
+            framingRequest: framingRequest,
             shots: currentHoleShots,
             currentHole: courseHoles.indices.contains(currentHoleIndex) ? courseHoles[currentHoleIndex] : nil,
             isPlayMode: appMode == .play && displayedCourse != nil,
@@ -593,6 +640,83 @@ struct ContentView: View {
         applySubCourseState(from: osmCourse, for: course)
         applyOutline(from: osmCourse, for: course)
         applyFeatures(from: osmCourse, for: course)
+        // Once real geometry first arrives for this course, upgrade the coarse
+        // selection frame to the actual footprint (or, if already in Play mode,
+        // the current hole). Gated on the course id so cached-then-network redraws
+        // don't re-frame a map the user may have since panned.
+        guard displayedCourse?.identifier == course.identifier,
+              framedFootprintCourseID != course.identifier,
+              !courseOutlines.isEmpty || !courseHoles.isEmpty else { return }
+        framedFootprintCourseID = course.identifier
+        if appMode == .play {
+            frameCurrentHole()
+        } else {
+            frameCourseFootprint(for: course)
+        }
+    }
+
+    /// Frames the whole course top-down so its footprint fills the screen. Prefers
+    /// the boundary rings, falls back to hole geometry, then to a fixed box around
+    /// the course point when no geometry is available.
+    private func frameCourseFootprint(for course: GolfCourse) {
+        let ringCoords = courseOutlines.flatMap { $0 }
+        let holeCoords = courseHoles.flatMap { hole in
+            hole.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        }
+        let coords = ringCoords.isEmpty ? holeCoords : ringCoords
+        let region = coords.isEmpty
+            ? MKCoordinateRegion(center: course.coordinate, latitudinalMeters: 2000, longitudinalMeters: 2000)
+            : regionTightlyFitting(coords)
+        framingRequest = MapFramingRequest(framing: .topDown(region))
+    }
+
+    /// Like `regionFitting` but tuned for a single course footprint rather than the
+    /// 50-mile browse map: minimal edge padding and a small minimum span so a
+    /// compact course fills the screen instead of sitting as a speck. The generous
+    /// 0.05° floor / 1.3× padding in `regionFitting` are deliberately kept for the
+    /// nearby-courses view and would otherwise leave a course zoomed too far out.
+    private func regionTightlyFitting(_ coordinates: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+        guard let first = coordinates.first else { return MKCoordinateRegion(.world) }
+        var minLat = first.latitude, maxLat = first.latitude
+        var minLon = first.longitude, maxLon = first.longitude
+        for c in coordinates.dropFirst() {
+            minLat = min(minLat, c.latitude); maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude); maxLon = max(maxLon, c.longitude)
+        }
+        let center = CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLon + maxLon) / 2
+        )
+        // ~8% edge padding, and a ~300 m minimum span so a tiny parcel or a
+        // single-hole course doesn't zoom to street level.
+        let span = MKCoordinateSpan(
+            latitudeDelta: max((maxLat - minLat) * 1.08, 0.0027),
+            longitudeDelta: max((maxLon - minLon) * 1.08, 0.0027)
+        )
+        return MKCoordinateRegion(center: center, span: span)
+    }
+
+    /// Frames the current hole with a tilted, heading-aware camera aimed down its
+    /// tee→pin axis. No-op unless in Play mode with a course open and the hole has
+    /// at least a tee and a pin. Distance is derived from the hole length so short
+    /// par-3s and long par-5s both frame sensibly.
+    private func frameCurrentHole() {
+        guard appMode == .play, displayedCourse != nil,
+              courseHoles.indices.contains(currentHoleIndex) else { return }
+        let coords = courseHoles[currentHoleIndex].coordinates
+        guard coords.count >= 2, let teeC = coords.first, let pinC = coords.last else { return }
+        let tee = CLLocationCoordinate2D(latitude: teeC.lat, longitude: teeC.lon)
+        let pin = CLLocationCoordinate2D(latitude: pinC.lat, longitude: pinC.lon)
+        let length = Geo.distance(tee, pin)
+        // Fit the tee→pin span with headroom; clamp so a stray coordinate can't
+        // fling the camera to space or bury it in the turf.
+        let distance = min(max(length * 1.6 + 150, 300), 4_000)
+        framingRequest = MapFramingRequest(framing: .camera(
+            center: Geo.midpoint(tee, pin),
+            distance: distance,
+            pitch: 55,
+            heading: Geo.bearing(from: tee, to: pin)
+        ))
     }
 
     /// Publishes the facility's sub-courses and defaults the active selection to
@@ -621,9 +745,23 @@ struct ContentView: View {
     /// active. Attribution is precomputed at build time (`holeIDs`), so render is a
     /// pure membership filter.
     func visibleHoles(in osmCourse: OSMCourse) -> [OSMHole] {
-        guard let sub = activeSubCourse(in: osmCourse) else { return osmCourse.holes }
-        let ids = Set(sub.holeIDs)
-        return osmCourse.holes.filter { ids.contains($0.osmIdentifier) }
+        let holes: [OSMHole]
+        if let sub = activeSubCourse(in: osmCourse) {
+            let ids = Set(sub.holeIDs)
+            holes = osmCourse.holes.filter { ids.contains($0.osmIdentifier) }
+        } else {
+            holes = osmCourse.holes
+        }
+        // Re-sort numerically here as well as at build time: cache rows written
+        // before the numeric-sort fix are still stored in lexicographic order
+        // ("1, 10, 11 … 2 …"), which would make hole navigation jump 1→10 until the
+        // course is refetched. Sorting at display time fixes those immediately.
+        return holes.sorted { lhs, rhs in
+            let l = lhs.ref.flatMap { Int($0) } ?? Int.max
+            let r = rhs.ref.flatMap { Int($0) } ?? Int.max
+            if l != r { return l < r }
+            return (lhs.ref ?? "") < (rhs.ref ?? "")
+        }
     }
 
     /// Features attributed to the active sub-course; all features when no sub-course
@@ -963,7 +1101,9 @@ struct ContentView: View {
 
         // Frame everything: all course markers plus the user's own location.
         guard displayedCourse == nil else { return }
-        regionRequest = MapRegionRequest(region: regionFitting(courses.map(\.coordinate) + [center]))
+        framingRequest = MapFramingRequest(
+            framing: .topDown(regionFitting(courses.map(\.coordinate) + [center]))
+        )
     }
 
     /// Re-runs the golf-course search over the region the user has panned/zoomed

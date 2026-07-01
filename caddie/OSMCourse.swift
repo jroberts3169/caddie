@@ -691,7 +691,16 @@ nonisolated enum OSMCourseBuilder {
                     tags: way.tags ?? [:]
                 )
             }
-            .sorted { ($0.ref ?? "") < ($1.ref ?? "") }
+            // Order by hole number *numerically* — a lexicographic sort would order
+            // refs as "1, 10, 11 … 18, 2, 3 …", making Play-mode navigation jump from
+            // hole 1 straight to 10. Non-numeric / missing refs sort last, then by
+            // string for a stable order.
+            .sorted { lhs, rhs in
+                let l = lhs.ref.flatMap { Int($0) } ?? Int.max
+                let r = rhs.ref.flatMap { Int($0) } ?? Int.max
+                if l != r { return l < r }
+                return (lhs.ref ?? "") < (rhs.ref ?? "")
+            }
     }
 
     private static func features(
