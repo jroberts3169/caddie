@@ -870,6 +870,16 @@ extension CourseMapView {
             let view = (mapView.dequeueReusableAnnotationView(withIdentifier: id) as? MKMarkerAnnotationView)
                 ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: id)
             view.annotation = annotation
+            // Reset mutable visual state that survives recycling. A marker that was
+            // selected (which enlarges the balloon and lifts its glyph) leaves the
+            // glyph label vertically offset when the view is later reused for a
+            // different annotation — visible as hole numbers sitting too high on the
+            // tee markers after a sub-course switch removes+re-adds every tee. Clear
+            // the glyph and offset here so each caller starts from a clean marker.
+            view.setSelected(false, animated: false)
+            view.centerOffset = .zero
+            view.glyphText = nil
+            view.glyphImage = nil
             return view
         }
 
