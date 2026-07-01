@@ -210,6 +210,10 @@ struct ContentView: View {
     /// The sub-course currently shown, or `nil` when the displayed course is a single
     /// course (or, transiently, before its OSM data has loaded).
     @State private var activeSubCourseID: String?
+    /// Latest pointer location over the map (map-local coordinates), or `nil` when
+    /// the pointer is elsewhere. Drives the Play-mode hover preview that lifts a
+    /// dimmed hole back to full opacity.
+    @State private var mapHoverLocation: CGPoint?
     /// The framing the map should apply (top-down course region or a tilted
     /// per-hole camera). Tagged with an identity token so re-selecting the same
     /// course re-frames it (an equal value would otherwise be diffed as "no
@@ -565,6 +569,7 @@ struct ContentView: View {
             shots: currentHoleShots,
             currentHole: courseHoles.indices.contains(currentHoleIndex) ? courseHoles[currentHoleIndex] : nil,
             isPlayMode: appMode == .play && displayedCourse != nil,
+            hoverLocation: mapHoverLocation,
             onAddShot: addShotToCurrentHole,
             onSelectHole: selectHole(withID:),
             onSelectCourse: { identifier in
@@ -581,6 +586,15 @@ struct ContentView: View {
             }
         )
         .ignoresSafeArea()
+        .onContinuousHover { phase in
+            // Feed the pointer location to the map so hovering a dimmed hole in Play
+            // mode lifts it to full opacity. `.local` matches the map's top-left,
+            // y-down coordinate space (MKMapView is flipped), so it needs no flip.
+            switch phase {
+            case .active(let location): mapHoverLocation = location
+            case .ended: mapHoverLocation = nil
+            }
+        }
         .overlay(alignment: .bottom) {
             searchHereButton
         }
