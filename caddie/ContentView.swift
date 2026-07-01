@@ -1018,7 +1018,7 @@ struct ContentView: View {
                 Section("Favorites") {
                     ForEach(favorites) { favorite in
                         let course = favorite.asGolfCourse
-                        courseRow(course: course, subtitle: nil)
+                        courseRow(course: course, subtitle: nil, kind: "favorite")
                             .tag(SidebarSelection.favorite(course))
                         subCourseRows(for: course)
                         
@@ -1029,7 +1029,7 @@ struct ContentView: View {
                 Section("Recents") {
                     ForEach(recents) { recent in
                         let course = recent.asGolfCourse
-                        courseRow(course: course, subtitle: nil)
+                        courseRow(course: course, subtitle: nil, kind: "recent")
                             .tag(SidebarSelection.recent(course))
                             .contextMenu {
                                 Button("Remove from Recents", systemImage: "trash", role: .destructive) {
@@ -1043,7 +1043,7 @@ struct ContentView: View {
             if !searchResults.isEmpty {
                 Section("Results") {
                     ForEach(searchResults) { course in
-                        courseRow(course: course, subtitle: locationSubtitle(for: course))
+                        courseRow(course: course, subtitle: locationSubtitle(for: course), kind: "result")
                             .tag(SidebarSelection.result(course))
                         subCourseRows(for: course)
                     }
@@ -1061,7 +1061,7 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    func courseRow(course: GolfCourse, subtitle: String?) -> some View {
+    func courseRow(course: GolfCourse, subtitle: String?, kind: String) -> some View {
         HStack {
             VStack(alignment: .leading) {
                 Text(course.name)
@@ -1080,10 +1080,10 @@ struct ContentView: View {
                     .foregroundStyle(isFavorite(course) ? .yellow : .secondary)
             }
             .buttonStyle(.plain)
-            .accessibilityIdentifier("favoriteToggle_\(course.identifier)")
+            .accessibilityIdentifier("favoriteToggle_\(kind)_\(course.identifier)")
         }
         .contentShape(Rectangle())
-        .accessibilityIdentifier("courseRow_\(course.identifier)")
+        .accessibilityIdentifier("courseRow_\(kind)_\(course.identifier)")
     }
 
     /// Indented child rows for a multi-course facility, emitted right beneath its
