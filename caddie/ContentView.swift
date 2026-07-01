@@ -350,6 +350,7 @@ struct ContentView: View {
                         .padding(.vertical, 2)
                     }
                     .help("Switch to \(appMode.toggled.rawValue) mode")
+                    .accessibilityIdentifier("modeToggleButton")
                 }
             }
             if displayedSubCourses.count > 1 {
@@ -1079,8 +1080,10 @@ struct ContentView: View {
                     .foregroundStyle(isFavorite(course) ? .yellow : .secondary)
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("favoriteToggle_\(course.identifier)")
         }
         .contentShape(Rectangle())
+        .accessibilityIdentifier("courseRow_\(course.identifier)")
     }
 
     /// Indented child rows for a multi-course facility, emitted right beneath its

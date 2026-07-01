@@ -26,22 +26,10 @@ struct PlayDetailPane: View {
     /// (e.g. shot 1 on a hole with no tee geometry). Mirrors the segment logic the
     /// map uses to draw yardage pills so the two always agree.
     private var shotYards: [Int?] {
-        var result: [Int?] = []
-        var previous: CLLocationCoordinate2D?
-        if let tee = currentHole?.coordinates.first {
-            previous = CLLocationCoordinate2D(latitude: tee.lat, longitude: tee.lon)
+        let tee = currentHole?.coordinates.first.map {
+            CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
         }
-        for shot in shots {
-            if let from = previous {
-                let meters = CLLocation(latitude: from.latitude, longitude: from.longitude)
-                    .distance(from: CLLocation(latitude: shot.coordinate.latitude, longitude: shot.coordinate.longitude))
-                result.append(Int((meters * 1.09361).rounded()))
-            } else {
-                result.append(nil)
-            }
-            previous = shot.coordinate
-        }
-        return result
+        return ShotYardage.yards(tee: tee, shots: shots.map(\.coordinate))
     }
 
     var body: some View {
@@ -56,11 +44,13 @@ struct PlayDetailPane: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(currentHoleIndex == 0 || holes.isEmpty)
+                .accessibilityIdentifier("holePrevButton")
 
                 Spacer()
 
                 Text(holeTitle)
                     .font(.title2.bold())
+                    .accessibilityIdentifier("holeTitleLabel")
 
                 Spacer()
 
@@ -72,6 +62,7 @@ struct PlayDetailPane: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(currentHoleIndex >= holes.count - 1 || holes.isEmpty)
+                .accessibilityIdentifier("holeNextButton")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -168,6 +159,7 @@ struct PlayDetailPane: View {
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 12)
+                .accessibilityIdentifier("clearShotsButton")
             }
         }
     }
