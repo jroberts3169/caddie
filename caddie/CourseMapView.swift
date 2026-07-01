@@ -296,8 +296,10 @@ private final class HoleTeeAnnotation: NSObject, MKAnnotation {
 /// Small filled disc at a hole's green (the pin position).
 private final class HolePinAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
-    init(coordinate: CLLocationCoordinate2D) {
+    let osmIdentifier: Int64
+    init(coordinate: CLLocationCoordinate2D, osmIdentifier: Int64) {
         self.coordinate = coordinate
+        self.osmIdentifier = osmIdentifier
     }
 }
 
@@ -337,6 +339,9 @@ extension CourseMapView {
         var onCameraMoved: ((MKCoordinateRegion) -> Void)?
         /// Whether a click should record a shot.
         var isPlayMode: Bool = false
+        /// OSM id of the hole currently focused in Play mode. Every other hole's
+        /// tee/pin marker is dimmed so the active hole reads as the subject.
+        var currentHoleID: Int64?
 
         /// Hash of the inputs that determine the overlay set, so we only rebuild
         /// overlays (an expensive add/remove) when the geometry or style changes.
@@ -372,6 +377,7 @@ extension CourseMapView {
             currentHole: OSMHole?,
             framingRequest: MapFramingRequest?
         ) {
+            currentHoleID = currentHole?.osmIdentifier
             let segments = shotSegments(shots: shots, currentHole: currentHole)
             syncOverlays(
                 map: map,
@@ -394,6 +400,7 @@ extension CourseMapView {
                 segments: segments
             )
             applyFraming(map: map, framingRequest: framingRequest)
+            updateHoleEmphasis(map: map)
         }
 
         // MARK: Clicks
@@ -687,7 +694,7 @@ extension CourseMapView {
                             ))
                         }
                         if let pin = coords.last, coords.count >= 2 {
-                            map.addAnnotation(HolePinAnnotation(coordinate: pin))
+                            map.addAnnotation(HolePinAnnotation(coordinate: pin, osmIdentifier: hole.osmIdentifier))
                         }
                     }
                 }
@@ -800,9 +807,21 @@ extension CourseMapView {
                 view.glyphText = tee.glyph
                 view.displayPriority = .required
                 view.canShowCallout = true
+                view.alphaValue = emphasisAlpha(for: tee.osmIdentifier)
                 return view
 
             case let pin as HolePinAnnotation:
+                if isPlayMode && pin.osmIdentifier == currentHoleID {
+                    // Focused hole: flag on the standard balloon marker.
+                    let view = dequeueMarker(mapView, id: "holePinFlag", for: pin)
+                    view.markerTintColor = currentStyle?.color(.holes) ?? .systemBlue
+                    view.glyphImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: nil)
+                    view.displayPriority = .required
+                    view.canShowCallout = false
+                    view.alphaValue = 1
+                    return view
+                }
+                // Other holes: small disc.
                 let id = "holePin"
                 let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
                     ?? MKAnnotationView(annotation: pin, reuseIdentifier: id)
@@ -816,6 +835,7 @@ extension CourseMapView {
                 layer.cornerRadius = size / 2
                 layer.backgroundColor = (currentStyle?.color(.holes) ?? .systemBlue).cgColor
                 view.layer = layer
+                view.alphaValue = emphasisAlpha(for: pin.osmIdentifier)
                 return view
 
             case let shot as ShotAnnotation:
@@ -881,6 +901,55 @@ extension CourseMapView {
             view.glyphText = nil
             view.glyphImage = nil
             return view
+        }
+
+        /// Opacity a hole's tee/pin marker should render at. In Play mode every hole
+        /// other than the focused one is dimmed so the active hole stands out; in
+        /// Plan mode (or before a hole is chosen) all markers are fully opaque.
+        private func emphasisAlpha(for holeID: Int64) -> CGFloat {
+            guard isPlayMode, let current = currentHoleID else { return 1 }
+            return holeID == current ? 1 : 0.3
+        }
+
+        /// Re-applies `emphasisAlpha` to the tee/pin views already on the map, and
+        /// refreshes each pin's flag/disc styling. MapKit only calls `viewFor` on
+        /// add/recycle, so when the focused hole changes (advancing holes, switching
+        /// sub-course, entering/leaving Play) the existing markers must be updated in
+        /// place. Fades so the change reads as a deliberate emphasis shift rather
+        /// than a pop.
+        private func updateHoleEmphasis(map: MKMapView) {
+            // A pin's view CLASS depends on whether it's the focused hole (balloon
+            // flag marker vs. plain disc). MapKit caches the last view it built, so a
+            // hole change needs the stale pin views re-materialized to pick up the
+            // right class. Remove+re-add only the pins whose kind actually changed.
+            let staleFlags = map.annotations.compactMap { annotation -> HolePinAnnotation? in
+                guard let pin = annotation as? HolePinAnnotation,
+                      let view = map.view(for: pin) else { return nil }
+                let wantsFlag = isPlayMode && pin.osmIdentifier == currentHoleID
+                let hasFlag = view is MKMarkerAnnotationView
+                return wantsFlag != hasFlag ? pin : nil
+            }
+            if !staleFlags.isEmpty {
+                map.removeAnnotations(staleFlags)
+                map.addAnnotations(staleFlags)
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                context.allowsImplicitAnimation = true
+                for annotation in map.annotations {
+                    let holeID: Int64
+                    switch annotation {
+                    case let tee as HoleTeeAnnotation: holeID = tee.osmIdentifier
+                    case let pin as HolePinAnnotation: holeID = pin.osmIdentifier
+                    default: continue
+                    }
+                    guard let view = map.view(for: annotation) else { continue }
+                    let target = emphasisAlpha(for: holeID)
+                    if view.alphaValue != target {
+                        view.animator().alphaValue = target
+                    }
+                }
+            }
         }
 
         /// Compact hole label, e.g. "Par 4 · 410y". Falls back to the
