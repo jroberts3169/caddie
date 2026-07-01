@@ -170,6 +170,9 @@ struct CourseMapView: NSViewRepresentable {
     var onAddShot: (CLLocationCoordinate2D) -> Void
     /// Called with a hole's OSM id when its tee marker is tapped in Play mode.
     var onSelectHole: (Int64) -> Void
+    /// Called with a nearby course's identifier when its flag is tapped on the
+    /// browse map, so that course can be opened.
+    var onSelectCourse: (String) -> Void
     /// Called with the new region after the user pans/zooms the map (not fired for
     /// programmatic camera moves), so a "Search here" affordance can be offered.
     var onCameraMoved: (MKCoordinateRegion) -> Void
@@ -212,6 +215,7 @@ struct CourseMapView: NSViewRepresentable {
         guard let map = context.coordinator.map else { return }
         context.coordinator.onAddShot = onAddShot
         context.coordinator.onSelectHole = onSelectHole
+        context.coordinator.onSelectCourse = onSelectCourse
         context.coordinator.onCameraMoved = onCameraMoved
         context.coordinator.isPlayMode = isPlayMode
         context.coordinator.sync(
@@ -335,6 +339,8 @@ extension CourseMapView {
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
         /// Called with a tapped tee's hole OSM id while in Play mode.
         var onSelectHole: ((Int64) -> Void)?
+        /// Called with a tapped nearby course's identifier on the browse map.
+        var onSelectCourse: ((String) -> Void)?
         /// Called with the new region after a user-initiated pan/zoom.
         var onCameraMoved: ((MKCoordinateRegion) -> Void)?
         /// Whether a click should record a shot.
@@ -413,8 +419,16 @@ extension CourseMapView {
         /// coordinate is projected to its on-screen tip and a balloon-shaped rect is
         /// anchored there. The nearest tee whose balloon contains the click wins.
         @objc func handleMapClick(_ gesture: NSClickGestureRecognizer) {
-            guard isPlayMode, let map else { return }
+            guard let map else { return }
             let point = gesture.location(in: map)
+
+            // On the browse map a click on a nearby course's flag opens that course.
+            if let nearby = nearestNearbyCourse(to: point, in: map) {
+                onSelectCourse?(nearby.identifier)
+                return
+            }
+
+            guard isPlayMode else { return }
 
             if let tee = nearestTee(to: point, in: map) {
                 onSelectHole?(tee.osmIdentifier)
@@ -449,6 +463,25 @@ extension CourseMapView {
                 }
             }
             return best?.tee
+        }
+
+        /// The nearby-course flag whose balloon glyph contains `point`, or `nil` if
+        /// the click missed every flag. Uses the same balloon-geometry hit test as
+        /// the tees (an `MKMarkerAnnotationView`'s frame doesn't line up with its
+        /// visible glyph). When flags overlap, the one whose tip is nearest wins.
+        private func nearestNearbyCourse(to point: CGPoint, in map: MKMapView) -> NearbyCourseAnnotation? {
+            var best: (course: NearbyCourseAnnotation, distance: CGFloat)?
+            for course in map.annotations.compactMap({ $0 as? NearbyCourseAnnotation }) {
+                let tip = map.convert(course.coordinate, toPointTo: map)
+                let balloon = CGRect(x: tip.x - 24, y: tip.y - 56, width: 48, height: 60)
+                guard balloon.contains(point) else { continue }
+                let dx = point.x - tip.x, dy = point.y - tip.y
+                let distance = (dx * dx + dy * dy).squareRoot()
+                if best == nil || distance < best!.distance {
+                    best = (course, distance)
+                }
+            }
+            return best?.course
         }
 
         // MARK: Overlays

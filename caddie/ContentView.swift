@@ -281,8 +281,33 @@ struct ContentView: View {
         }
         .onChange(of: selection) { _, newValue in
             guard let course = newValue?.course else {
-                markerCoordinate = nil
+                // Returning to the nearby browse map: tear down the opened course
+                // and its overlays, then re-frame so every nearby flag is visible.
                 appMode = .plan
+                displayedCourse = nil
+                markerCoordinate = nil
+                courseOutlines = []
+                courseFeatures = []
+                courseHoles = []
+                displayedSubCourses = []
+                activeSubCourseID = nil
+                currentHoleIndex = 0
+                shotsByHole = [:]
+                pendingSearchRegion = nil
+                framedFootprintCourseID = nil
+                featureRenderTask?.cancel()
+                if !nearbyCourses.isEmpty {
+                    framingRequest = MapFramingRequest(
+                        framing: .topDown(regionFitting(nearbyCourses.map(\.coordinate)))
+                    )
+                } else {
+                    // No nearby results cached (e.g. opened straight from search):
+                    // re-run the local search around the user's location.
+                    Task {
+                        guard let coordinate = await locationManager.currentCoordinate() else { return }
+                        await loadNearbyCourses(around: coordinate)
+                    }
+                }
                 return
             }
             displayedCourse = course
@@ -382,6 +407,27 @@ struct ContentView: View {
             await loadNearbyCourses(around: coordinate)
         }
         .toolbar {
+            if displayedCourse != nil {
+                ToolbarItem(placement: .navigation) {
+                    Button {
+                        // Deselecting returns to the nearby browse map (handled by
+                        // `.onChange(of: selection)`), where the local-area search is
+                        // available again.
+                        selection = nil
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "chevron.backward")
+                                .frame(width: 16)
+                            Text("Courses")
+                                .fixedSize()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                    }
+                    .help("Back to nearby courses")
+                    .accessibilityIdentifier("backToNearbyButton")
+                }
+            }
             if displayedCourse != nil {
                 ToolbarItem(placement: .navigation) {
                     Button {
@@ -508,6 +554,12 @@ struct ContentView: View {
             isPlayMode: appMode == .play && displayedCourse != nil,
             onAddShot: addShotToCurrentHole,
             onSelectHole: selectHole(withID:),
+            onSelectCourse: { identifier in
+                // Tapping a nearby course flag opens that course, exactly as if it
+                // had been picked from the sidebar.
+                guard let course = nearbyCourses.first(where: { $0.identifier == identifier }) else { return }
+                selection = .result(course)
+            },
             onCameraMoved: { region in
                 // Offer a re-search only while browsing the nearby map (no course
                 // open) — panning around an opened course shouldn't prompt it.
