@@ -366,6 +366,7 @@ struct ContentView: View {
                                 }
                             }
                         }
+                        .accessibilityIdentifier("subCourseItem_all")
                         Divider()
                         ForEach(displayedSubCourses) { sub in
                             Button {
@@ -378,6 +379,7 @@ struct ContentView: View {
                                     }
                                 }
                             }
+                            .accessibilityIdentifier("subCourseItem_\(sub.id)")
                         }
                     } label: {
                         HStack(spacing: 8) {
@@ -390,6 +392,8 @@ struct ContentView: View {
                         .padding(.vertical, 2)
                     }
                     .menuStyle(.button)
+                    .accessibilityIdentifier("subCoursePickerButton")
+                    .accessibilityValue(activeSubCourseLabel)
                 }
             }
         }
@@ -1083,6 +1087,10 @@ struct ContentView: View {
             .accessibilityIdentifier("favoriteToggle_\(kind)_\(course.identifier)")
         }
         .contentShape(Rectangle())
+        // `.contain` keeps the star toggle addressable as its own accessibility
+        // element; without it the row-level identifier below clears descendant
+        // identifiers (so UI tests can't find `favoriteToggle_…`).
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("courseRow_\(kind)_\(course.identifier)")
     }
 
