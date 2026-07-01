@@ -35,15 +35,80 @@ struct Shot: Identifiable, Equatable {
     }
 }
 
-/// A region the map should frame, tagged with an identity token so re-applying
-/// the *same* region (e.g. re-selecting a course) still takes effect. SwiftUI
-/// would otherwise diff two equal regions as "no change" and skip the update.
-struct MapRegionRequest: Equatable {
-    var region: MKCoordinateRegion
+/// How the map should frame its subject: a flat top-down region (for a whole
+/// course) or a tilted, heading-aware 3D camera (for a single hole aimed down
+/// the fairway).
+enum MapFraming: Equatable {
+    /// Flat, straight-down framing of a coordinate region — used when a course is
+    /// first selected so its entire footprint fills the screen.
+    case topDown(MKCoordinateRegion)
+    /// Tilted camera looking at `center` from `distance` metres
+    /// (`centerCoordinateDistance`, NOT altitude), pitched and rotated to
+    /// `heading` — used to frame a hole down its tee→pin axis.
+    case camera(
+        center: CLLocationCoordinate2D,
+        distance: CLLocationDistance,
+        pitch: CGFloat,
+        heading: CLLocationDirection
+    )
+
+    static func == (lhs: MapFraming, rhs: MapFraming) -> Bool {
+        switch (lhs, rhs) {
+        case let (.topDown(a), .topDown(b)):
+            return a.center.latitude == b.center.latitude
+                && a.center.longitude == b.center.longitude
+                && a.span.latitudeDelta == b.span.latitudeDelta
+                && a.span.longitudeDelta == b.span.longitudeDelta
+        case let (.camera(ac, ad, ap, ah), .camera(bc, bd, bp, bh)):
+            return ac.latitude == bc.latitude && ac.longitude == bc.longitude
+                && ad == bd && ap == bp && ah == bh
+        default:
+            return false
+        }
+    }
+}
+
+/// A framing the map should apply, tagged with an identity token so re-applying
+/// the *same* framing (e.g. re-selecting a course, or re-focusing the same hole)
+/// still takes effect. SwiftUI would otherwise diff two equal values as "no
+/// change" and skip the update.
+struct MapFramingRequest: Equatable {
+    var framing: MapFraming
     var id: UUID = UUID()
 
-    static func == (lhs: MapRegionRequest, rhs: MapRegionRequest) -> Bool {
+    static func == (lhs: MapFramingRequest, rhs: MapFramingRequest) -> Bool {
         lhs.id == rhs.id
+    }
+}
+
+/// Small spherical-geometry helpers for framing a hole down its tee→pin axis.
+enum Geo {
+    /// Great-circle distance in metres.
+    static func distance(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> CLLocationDistance {
+        CLLocation(latitude: a.latitude, longitude: a.longitude)
+            .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude))
+    }
+
+    /// Initial bearing (compass degrees, 0 = north) from `a` to `b`.
+    static func bearing(from a: CLLocationCoordinate2D, to b: CLLocationCoordinate2D) -> CLLocationDirection {
+        let lat1 = a.latitude * .pi / 180, lat2 = b.latitude * .pi / 180
+        let dLon = (b.longitude - a.longitude) * .pi / 180
+        let y = sin(dLon) * cos(lat2)
+        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        let deg = atan2(y, x) * 180 / .pi
+        return (deg + 360).truncatingRemainder(dividingBy: 360)
+    }
+
+    /// Midpoint along the great-circle arc between `a` and `b`.
+    static func midpoint(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> CLLocationCoordinate2D {
+        let lat1 = a.latitude * .pi / 180, lon1 = a.longitude * .pi / 180
+        let lat2 = b.latitude * .pi / 180, dLon = (b.longitude - a.longitude) * .pi / 180
+        let bx = cos(lat2) * cos(dLon)
+        let by = cos(lat2) * sin(dLon)
+        let lat3 = atan2(sin(lat1) + sin(lat2),
+                         sqrt((cos(lat1) + bx) * (cos(lat1) + bx) + by * by))
+        let lon3 = lon1 + atan2(by, cos(lat1) + bx)
+        return CLLocationCoordinate2D(latitude: lat3 * 180 / .pi, longitude: lon3 * 180 / .pi)
     }
 }
 
@@ -93,8 +158,8 @@ struct CourseMapView: NSViewRepresentable {
     var nearbyCourses: [GolfCourse]
     /// Resolved per-layer colors + visibility.
     var style: MapStyleConfig
-    /// The region to frame, or `nil` to leave the camera where it is.
-    var regionRequest: MapRegionRequest?
+    /// The framing to apply, or `nil` to leave the camera where it is.
+    var framingRequest: MapFramingRequest?
     /// Recorded shots for the hole currently focused in Play mode.
     var shots: [Shot]
     /// The hole currently focused in Play mode.
@@ -160,7 +225,7 @@ struct CourseMapView: NSViewRepresentable {
             style: style,
             shots: shots,
             currentHole: currentHole,
-            regionRequest: regionRequest
+            framingRequest: framingRequest
         )
     }
 }
@@ -305,7 +370,7 @@ extension CourseMapView {
             style: MapStyleConfig,
             shots: [Shot],
             currentHole: OSMHole?,
-            regionRequest: MapRegionRequest?
+            framingRequest: MapFramingRequest?
         ) {
             let segments = shotSegments(shots: shots, currentHole: currentHole)
             syncOverlays(
@@ -328,7 +393,7 @@ extension CourseMapView {
                 shots: shots,
                 segments: segments
             )
-            applyRegion(map: map, regionRequest: regionRequest)
+            applyFraming(map: map, framingRequest: framingRequest)
         }
 
         // MARK: Clicks
@@ -882,19 +947,60 @@ extension CourseMapView {
 
         // MARK: Region
 
-        private func applyRegion(map: MKMapView, regionRequest: MapRegionRequest?) {
-            guard let request = regionRequest, request.id != appliedRegionID else { return }
+        private func applyFraming(map: MKMapView, framingRequest: MapFramingRequest?) {
+            guard let request = framingRequest, request.id != appliedRegionID else { return }
             appliedRegionID = request.id
             // Animate only short hops; a long cross-country jump animated would make
-            // MapKit stream imagery along the whole flight path and stall.
-            let from = map.region.center
-            let to = request.region.center
+            // MapKit stream imagery along the whole flight path and stall (leaving the
+            // base map blank while overlays float).
+            let from = map.camera.centerCoordinate
+            let to: CLLocationCoordinate2D
+            switch request.framing {
+            case let .topDown(region): to = region.center
+            case let .camera(center, _, _, _): to = center
+            }
             let jump = CLLocation(latitude: from.latitude, longitude: from.longitude)
                 .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
+            let animated = jump < 5_000
             // Mark this as our own move so the ensuing regionDidChange isn't
             // mistaken for a user pan/zoom (which would pop the "Search here" button).
             isApplyingRegion = true
-            map.setRegion(request.region, animated: jump < 5_000)
+            switch request.framing {
+            case let .topDown(region):
+                // Draw the full-course overview straight at its final framing rather
+                // than animating a zoom-in to it — the pull-back/zoom read as awkward.
+                map.setRegion(region, animated: false)
+            case let .camera(center, distance, pitch, heading):
+                // `fromDistance` is centerCoordinateDistance (camera→look-at point),
+                // NOT altitude — passing an altitude here would snap the camera far
+                // closer than intended.
+                let camera = MKMapCamera(
+                    lookingAtCenter: center,
+                    fromDistance: distance,
+                    pitch: pitch,
+                    heading: heading
+                )
+                if animated {
+                    // MapKit's default `setCamera(animated:)` duration is quite
+                    // brisk; wrapping the call in an explicit `NSAnimationContext`
+                    // makes MapKit adopt that duration, so the hole-to-hole glide is
+                    // slower and easier to follow. `allowsImplicitAnimation` lets the
+                    // camera change ride the context's timing.
+                    NSAnimationContext.runAnimationGroup { ctx in
+                        ctx.duration = Self.holeCameraDuration
+                        ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                        ctx.allowsImplicitAnimation = true
+                        map.setCamera(camera, animated: true)
+                    }
+                } else {
+                    map.setCamera(camera, animated: false)
+                }
+            }
         }
+
+        /// How long the tilted per-hole camera glide takes, in seconds. Bumped well
+        /// above MapKit's brisk default so moving between holes reads as a smooth
+        /// fly-over rather than a snap.
+        private static let holeCameraDuration: TimeInterval = 1.6
     }
 }
