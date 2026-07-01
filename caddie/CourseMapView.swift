@@ -166,6 +166,11 @@ struct CourseMapView: NSViewRepresentable {
     var currentHole: OSMHole?
     /// Whether the map is in Play mode (clicking records a shot).
     var isPlayMode: Bool
+    /// Latest mouse-hover location in the map's local coordinate space, or `nil`
+    /// when the pointer is outside the map. Fed from SwiftUI's `.onContinuousHover`
+    /// (an external `NSTrackingArea` on `MKMapView` proved unreliable) so hovering a
+    /// dimmed hole in Play mode can lift it back to full opacity.
+    var hoverLocation: CGPoint?
     /// Called with the map coordinate of a click while in Play mode.
     var onAddShot: (CLLocationCoordinate2D) -> Void
     /// Called with a hole's OSM id when its tee marker is tapped in Play mode.
@@ -231,6 +236,9 @@ struct CourseMapView: NSViewRepresentable {
             currentHole: currentHole,
             framingRequest: framingRequest
         )
+        // Re-run after `sync` (which owns `currentHoleID`) so a hover computed here
+        // dims/undims against the up-to-date focused hole.
+        context.coordinator.hover(at: hoverLocation)
     }
 }
 
@@ -257,6 +265,9 @@ private final class StyledPolygon: MKPolygon {
 private final class StyledPolyline: MKPolyline {
     var layer: OverlayLayer = .unknown
     var role: OverlayRole = .feature
+    /// For `.hole` centerlines, the owning hole's OSM id, so the renderer can dim
+    /// every non-focused hole to match the tee/pin/label emphasis in Play mode.
+    var osmIdentifier: Int64?
 }
 
 // MARK: - Annotations
@@ -307,6 +318,22 @@ private final class HolePinAnnotation: NSObject, MKAnnotation {
     }
 }
 
+/// Par/distance text label beneath a hole's tee (e.g. "Par 4 · 410y"). We draw
+/// it ourselves rather than lean on the tee marker's native `title`: MapKit
+/// renders a marker's floating title in a separate layer that ignores the
+/// annotation view's `alphaValue`, so the native title can't be dimmed in step
+/// with the rest of the hole's markers. Owning it lets `emphasisAlpha` fade it.
+private final class HoleTitleAnnotation: NSObject, MKAnnotation {
+    @objc dynamic var coordinate: CLLocationCoordinate2D
+    let osmIdentifier: Int64
+    let text: String
+    init(coordinate: CLLocationCoordinate2D, osmIdentifier: Int64, text: String) {
+        self.coordinate = coordinate
+        self.osmIdentifier = osmIdentifier
+        self.text = text
+    }
+}
+
 /// Numbered marker for a recorded shot on the active hole.
 private final class ShotAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
@@ -348,6 +375,10 @@ extension CourseMapView {
         /// OSM id of the hole currently focused in Play mode. Every other hole's
         /// tee/pin marker is dimmed so the active hole reads as the subject.
         var currentHoleID: Int64?
+        /// OSM id of the hole whose marker the mouse is currently hovering (Play
+        /// mode). A hovered dimmed hole is lifted back to full opacity so it can be
+        /// previewed without leaving the active hole.
+        private var hoveredHoleID: Int64?
 
         /// Hash of the inputs that determine the overlay set, so we only rebuild
         /// overlays (an expensive add/remove) when the geometry or style changes.
@@ -446,17 +477,90 @@ extension CourseMapView {
             onAddShot?(coordinate)
         }
 
+        // MARK: Hover
+
+        /// Lifts the hovered hole to full opacity. Only meaningful in Play mode
+        /// (where other holes are dimmed). `point` is in the map's local coordinate
+        /// space (as delivered by SwiftUI's `.onContinuousHover`), or `nil` when the
+        /// pointer leaves the map. The hit test reuses the tee glyph geometry so
+        /// hovering a hole's numbered marker previews that hole's tee, dotted
+        /// centerline and stats label without switching the active hole.
+        func hover(at point: CGPoint?) {
+            guard let map else { return }
+            // `.onContinuousHover` reports in the SwiftUI view's coordinate space,
+            // which is offset from the MKMapView's own bounds (the map ignores the
+            // safe area and extends under the title bar), so its point can't be
+            // hit-tested against `map.convert`-projected tee tips. Read the pointer
+            // straight from the map's window instead — that lands in the exact same
+            // space as a click's `gesture.location(in: map)`, where the tee geometry
+            // is known to be correct. The passed point only signals hover vs. exit.
+            guard point != nil, let window = map.window else {
+                updateHover(to: nil, map: map)
+                return
+            }
+            let inMap = map.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            let holeID = hoveredHole(at: inMap, in: map)
+            updateHover(to: holeID, map: map)
+        }
+
+        /// Applies a new hovered-hole id, re-running the emphasis pass only when it
+        /// actually changes so a continuous mouse move doesn't thrash the map.
+        private func updateHover(to holeID: Int64?, map: MKMapView) {
+            guard holeID != hoveredHoleID else { return }
+            hoveredHoleID = holeID
+            updateHoleEmphasis(map: map)
+        }
+
+        /// The OSM id of the hole whose tee glyph is nearest `point` (within its
+        /// hit rect), or `nil` if the mouse is over no marker.
+        private func hoveredHole(at point: CGPoint, in map: MKMapView) -> Int64? {
+            var best: (id: Int64, distance: CGFloat)?
+            for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
+                let rect = teeHitRect(for: tee, in: map)
+                guard rect.contains(point) else { continue }
+                let dx = point.x - rect.midX, dy = point.y - rect.midY
+                let distance = (dx * dx + dy * dy).squareRoot()
+                if best == nil || distance < best!.distance {
+                    best = (tee.osmIdentifier, distance)
+                }
+            }
+            return best?.id
+        }
+
+        /// Screen-space hit rect for a tee's balloon glyph, in the map's coordinate
+        /// space. Prefers the annotation view's ACTUAL frame — MapKit positions and
+        /// billboards that view at a constant screen size regardless of camera
+        /// pitch/zoom, so its frame is reliable where a geometrically-estimated glyph
+        /// center is not — padded outward for an easier target. Falls back to a
+        /// balloon rect anchored at the projected coordinate tip when the view isn't
+        /// materialized (off-screen, or not yet drawn after an add).
+        private func teeHitRect(for tee: HoleTeeAnnotation, in map: MKMapView) -> CGRect {
+            let pad: CGFloat = 14
+            if let view = map.view(for: tee) {
+                return view.frame.insetBy(dx: -pad, dy: -pad)
+            }
+            // MKMarkerAnnotationView balloon: ~40pt wide, tip at bottom-center,
+            // rising ~52pt above the tip.
+            let tip = map.convert(tee.coordinate, toPointTo: map)
+            return CGRect(x: tip.x - 20, y: tip.y - 52, width: 40, height: 52)
+                .insetBy(dx: -pad, dy: -pad)
+        }
+
         /// The tee annotation whose balloon glyph contains `point`, or `nil` if the
-        /// click missed every tee. When balloons overlap, the one whose tip is
-        /// nearest the click wins (not the first in iteration order).
+        /// click missed every tee. When balloons overlap, the one whose hit rect
+        /// center is nearest the click wins (not the first in iteration order).
         private func nearestTee(to point: CGPoint, in map: MKMapView) -> HoleTeeAnnotation? {
             var best: (tee: HoleTeeAnnotation, distance: CGFloat)?
             for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
-                let tip = map.convert(tee.coordinate, toPointTo: map)
-                // Balloon rises up from the coordinate tip: ~48pt wide, ~60pt tall.
-                let balloon = CGRect(x: tip.x - 24, y: tip.y - 56, width: 48, height: 60)
-                guard balloon.contains(point) else { continue }
-                let dx = point.x - tip.x, dy = point.y - tip.y
+                // The current hole's own tee is where you record your tee shot, so it
+                // isn't a hole-switch target — clicks there fall through to `addShot`.
+                if tee.osmIdentifier == currentHoleID { continue }
+                // Hit-test against the marker's actual rendered frame (see
+                // `teeHitRect`), which stays accurate when the map is tilted into a
+                // hole where a geometric glyph-center estimate drifts.
+                let rect = teeHitRect(for: tee, in: map)
+                guard rect.contains(point) else { continue }
+                let dx = point.x - rect.midX, dy = point.y - rect.midY
                 let distance = (dx * dx + dy * dy).squareRoot()
                 if best == nil || distance < best!.distance {
                     best = (tee, distance)
@@ -563,6 +667,7 @@ extension CourseMapView {
                     let line = StyledPolyline(coordinates: coords, count: coords.count)
                     line.layer = .holes
                     line.role = .hole
+                    line.osmIdentifier = hole.osmIdentifier
                     map.addOverlay(line, level: .aboveLabels)
                 }
             }
@@ -603,6 +708,18 @@ extension CourseMapView {
             onCameraMoved?(mapView.region)
         }
 
+        /// The app drives all marker emphasis itself (hole focus, the flag on the
+        /// current pin, dimming) and navigates on tap, so MapKit's built-in
+        /// annotation selection is unwanted: a selected `MKMarkerAnnotationView`
+        /// enlarges its balloon and lifts its glyph, which reads as a hole number
+        /// "shifting" vertically and — because nothing else deselects it — persists
+        /// as you move between holes. Immediately deselecting keeps every marker in
+        /// its resting layout, killing that shift at the source (the `dequeueMarker`
+        /// reset only catches recycled views, not one selected while on the map).
+        func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
+            mapView.deselectAnnotation(view.annotation, animated: false)
+        }
+
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let poly = overlay as? StyledPolygon {
                 let renderer = MKPolygonRenderer(polygon: poly)
@@ -629,6 +746,9 @@ extension CourseMapView {
                 } else if line.role == .hole {
                     renderer.lineWidth = 2
                     renderer.lineDashPattern = [6, 4]
+                    if let id = line.osmIdentifier {
+                        renderer.strokeColor = color.withAlphaComponent(emphasisAlpha(for: id))
+                    }
                 } else {
                     renderer.lineWidth = 2
                 }
@@ -708,6 +828,7 @@ extension CourseMapView {
                 $0 is CourseMarkerAnnotation
                     || $0 is HoleTeeAnnotation
                     || $0 is HolePinAnnotation
+                    || $0 is HoleTitleAnnotation
                     || $0 is NearbyCourseAnnotation
             }
             map.removeAnnotations(toRemove)
@@ -722,8 +843,13 @@ extension CourseMapView {
                             map.addAnnotation(HoleTeeAnnotation(
                                 coordinate: tee,
                                 osmIdentifier: hole.osmIdentifier,
-                                glyph: hole.ref ?? "",
+                                glyph: hole.displayGlyph,
                                 title: Self.holeTitle(hole)
+                            ))
+                            map.addAnnotation(HoleTitleAnnotation(
+                                coordinate: tee,
+                                osmIdentifier: hole.osmIdentifier,
+                                text: Self.holeTitle(hole)
                             ))
                         }
                         if let pin = coords.last, coords.count >= 2 {
@@ -840,6 +966,11 @@ extension CourseMapView {
                 view.glyphText = tee.glyph
                 view.displayPriority = .required
                 view.canShowCallout = true
+                // The par/distance text is drawn by our own `HoleTitleAnnotation`
+                // so it can be dimmed; MapKit's native marker title can't be, so
+                // suppress it here to avoid an un-dimmable duplicate.
+                view.titleVisibility = .hidden
+                view.subtitleVisibility = .hidden
                 view.alphaValue = emphasisAlpha(for: tee.osmIdentifier)
                 return view
 
@@ -869,6 +1000,20 @@ extension CourseMapView {
                 layer.backgroundColor = (currentStyle?.color(.holes) ?? .systemBlue).cgColor
                 view.layer = layer
                 view.alphaValue = emphasisAlpha(for: pin.osmIdentifier)
+                return view
+
+            case let label as HoleTitleAnnotation:
+                let id = "holeTitle"
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: label, reuseIdentifier: id)
+                view.annotation = label
+                view.canShowCallout = false
+                view.displayPriority = .required
+                // Sit just below the tee marker's coordinate tip (positive y is down),
+                // where MapKit's native marker title used to float.
+                view.centerOffset = CGPoint(x: 0, y: 29)
+                view.image = holeTitleLabelImage(label.text)
+                view.alphaValue = emphasisAlpha(for: label.osmIdentifier)
                 return view
 
             case let shot as ShotAnnotation:
@@ -938,10 +1083,12 @@ extension CourseMapView {
 
         /// Opacity a hole's tee/pin marker should render at. In Play mode every hole
         /// other than the focused one is dimmed so the active hole stands out; in
-        /// Plan mode (or before a hole is chosen) all markers are fully opaque.
+        /// Plan mode (or before a hole is chosen) all markers are fully opaque. A
+        /// hovered hole is also lifted to full opacity so it can be previewed.
         private func emphasisAlpha(for holeID: Int64) -> CGFloat {
             guard isPlayMode, let current = currentHoleID else { return 1 }
-            return holeID == current ? 1 : 0.3
+            if holeID == current || holeID == hoveredHoleID { return 1 }
+            return 0.3
         }
 
         /// Re-applies `emphasisAlpha` to the tee/pin views already on the map, and
@@ -974,6 +1121,7 @@ extension CourseMapView {
                     switch annotation {
                     case let tee as HoleTeeAnnotation: holeID = tee.osmIdentifier
                     case let pin as HolePinAnnotation: holeID = pin.osmIdentifier
+                    case let label as HoleTitleAnnotation: holeID = label.osmIdentifier
                     default: continue
                     }
                     guard let view = map.view(for: annotation) else { continue }
@@ -982,6 +1130,17 @@ extension CourseMapView {
                         view.animator().alphaValue = target
                     }
                 }
+            }
+            // The dotted hole centerlines dim the same way, but overlay renderers
+            // aren't part of the AppKit animation graph — re-stroke each cached hole
+            // renderer with the new emphasis alpha and mark it for redraw.
+            for overlay in map.overlays {
+                guard let line = overlay as? StyledPolyline, line.role == .hole,
+                      let id = line.osmIdentifier,
+                      let renderer = map.renderer(for: overlay) as? MKPolylineRenderer else { continue }
+                let color = currentStyle?.color(line.layer) ?? .white
+                renderer.strokeColor = color.withAlphaComponent(emphasisAlpha(for: id))
+                renderer.setNeedsDisplay()
             }
         }
 
@@ -1055,6 +1214,32 @@ extension CourseMapView {
             let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]
             let textSize = text.size(withAttributes: attrs)
             return CGSize(width: max(34, ceil(textSize.width) + 14), height: 20)
+        }
+
+        /// Renders a hole's "Par 4 · 410y" label the way MapKit's native marker
+        /// title looked — white text with a soft dark shadow for legibility over
+        /// imagery, no pill — so the whole-view `alphaValue` can dim it in step with
+        /// the hole's markers. Padding leaves room for the shadow blur.
+        private func holeTitleLabelImage(_ text: String) -> NSImage {
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.9)
+            shadow.shadowBlurRadius = 3
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: para,
+                .shadow: shadow
+            ]
+            let textSize = text.size(withAttributes: attrs)
+            let pad: CGFloat = 6
+            let size = CGSize(width: ceil(textSize.width) + pad * 2, height: ceil(textSize.height) + pad * 2)
+            return NSImage(size: size, flipped: false) { rect in
+                text.draw(in: rect.insetBy(dx: pad, dy: pad), withAttributes: attrs)
+                return true
+            }
         }
 
         // MARK: Region

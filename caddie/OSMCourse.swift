@@ -97,6 +97,40 @@ nonisolated struct OSMHole: Codable, Hashable {
     let lengthMeters: Double?
     let coordinates: [Coordinate]
     let tags: [String: String]
+
+    /// Parses a hole `ref` into its leading number and any trailing course name.
+    /// OSM data is inconsistent: some facilities bake the nine's name into the ref
+    /// as "<number> <Course Name>" — parenthesized ("1 (Canyon Course)") or bare
+    /// ("3 Vineyard Course") — while ordinary courses use a plain number ("7"). The
+    /// leading integer is the hole number; the remainder (a single wrapping pair of
+    /// parentheses stripped) is the course name, or `nil` when absent.
+    static func parseRef(_ ref: String?) -> (number: Int?, courseName: String?) {
+        guard let trimmed = ref?.trimmingCharacters(in: .whitespaces), !trimmed.isEmpty else {
+            return (nil, nil)
+        }
+        let digits = trimmed.prefix { $0.isNumber }
+        let number = Int(digits)
+        var rest = trimmed.dropFirst(digits.count).trimmingCharacters(in: .whitespaces)
+        if rest.hasPrefix("("), rest.hasSuffix(")") {
+            rest = String(rest.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+        }
+        return (number, rest.isEmpty ? nil : rest)
+    }
+
+    /// The hole's numeric position (1…), parsed out of `ref`. `nil` when the ref is
+    /// missing or has no leading number.
+    var holeNumber: Int? { Self.parseRef(ref).number }
+
+    /// The course/nine name embedded in `ref` ("Canyon Course"), or `nil` when the
+    /// ref is a plain number.
+    var refCourseName: String? { Self.parseRef(ref).courseName }
+
+    /// The glyph to show on the tee marker: the parsed hole number when present,
+    /// else the raw ref (so a non-numeric ref still shows something).
+    var displayGlyph: String {
+        if let number = Self.parseRef(ref).number { return "\(number)" }
+        return ref ?? ""
+    }
 }
 
 nonisolated struct OSMFeature: Codable, Hashable {
@@ -318,6 +352,14 @@ nonisolated enum OSMCourseBuilder {
         if let tagged = tagBasedSubCourses(holes: holes, features: features, candidates: nonPrimary) {
             return tagged
         }
+        // Tier 1c — the nine's name is baked into each hole's `ref`
+        // ("1 (Canyon Course)", "3 Vineyard Course"; Steele Canyon). Runs before the
+        // polygon tier because such facilities are often mapped with a duplicate
+        // whole-facility boundary that would otherwise masquerade as a single
+        // sub-course; the ref names are the authoritative nine split here.
+        if let refNamed = refNameSubCourses(holes: holes, features: features, candidates: nonPrimary) {
+            return refNamed
+        }
         let polygons = polygonSubCourses(
             primary: primary, candidates: candidates, holes: holes, features: features,
             relationsByID: relationsByID, waysByID: waysByID, nodesByID: nodesByID
@@ -433,6 +475,64 @@ nonisolated enum OSMCourseBuilder {
                 }.map(\.osmIdentifier)
                 return OSMSubCourse(
                     id: "holename-\(key)", name: names[key] ?? key,
+                    boundary: displayBoundaries[key] ?? [],
+                    holeIDs: holes.map(\.osmIdentifier), featureIDs: featureIDs
+                )
+            }
+            .sorted { $0.holeIDs.count > $1.holeIDs.count }
+    }
+
+    /// Tier 1c: split a facility whose holes bake the nine's name into their `ref`
+    /// ("1 (Canyon Course)"…"9 (Canyon Course)", "1 Vineyard Course"…; Steele
+    /// Canyon's three nines). Group by the parsed ref course name; each group of
+    /// three or more holes is a sub-course whose boundary is a convex hull of its
+    /// holes (a real mapped polygon replaces it when a candidate name matches), with
+    /// untagged features attributed by the smallest containing hull. Returns `nil`
+    /// (not `[]`) when fewer than two distinct ref course names exist, so an ordinary
+    /// numeric-ref course is kept whole and the caller falls through to the polygon
+    /// tier.
+    private static func refNameSubCourses(
+        holes: [OSMHole],
+        features: [OSMFeature],
+        candidates: [CourseBoundary]
+    ) -> [OSMSubCourse]? {
+        // Group case-insensitively so "Canyon Course"/"canyon course" coalesce; keep
+        // the first hole's original casing for display. Drop groups of fewer than
+        // three holes so a stray mis-tagged ref can't peel off as a course.
+        let grouped = Dictionary(grouping: holes.compactMap { hole -> (String, OSMHole)? in
+            guard let name = hole.refCourseName else { return nil }
+            return (name.lowercased(), hole)
+        }, by: { $0.0 }).mapValues { $0.map(\.1) }
+        let plausible = grouped.filter { $0.value.count >= 3 }
+        guard plausible.count >= 2 else { return nil }
+
+        let names: [String: String] = plausible.reduce(into: [:]) { dict, entry in
+            dict[entry.key] = entry.value.lazy.compactMap { $0.refCourseName }.first ?? entry.key
+        }
+
+        // Convex hull per group — used for feature attribution even when a real
+        // polygon replaces it as the display boundary (the hull is tighter).
+        let hulls: [String: [[Coordinate]]] = plausible.mapValues { holes in
+            [GolfGeometry.buffered(GolfGeometry.convexHull(holes.flatMap(\.coordinates)), by: 0.08)]
+        }
+
+        let displayBoundaries: [String: [[Coordinate]]] = plausible.keys.reduce(into: [:]) { dict, key in
+            if let polygon = candidates.first(where: { candidateContainsGroupName($0.name, names[key]) }),
+               polygon.boundary.contains(where: { $0.count >= 3 }) {
+                dict[key] = polygon.boundary
+            } else {
+                dict[key] = hulls[key] ?? []
+            }
+        }
+
+        return plausible
+            .map { key, holes -> OSMSubCourse in
+                let featureIDs = features.filter { feature in
+                    guard let center = GolfGeometry.centroid(of: feature.coordinates) else { return false }
+                    return smallestContainer(of: center, in: hulls) == key
+                }.map(\.osmIdentifier)
+                return OSMSubCourse(
+                    id: "refname-\(key)", name: names[key] ?? key,
                     boundary: displayBoundaries[key] ?? [],
                     holeIDs: holes.map(\.osmIdentifier), featureIDs: featureIDs
                 )
@@ -696,8 +796,8 @@ nonisolated enum OSMCourseBuilder {
             // hole 1 straight to 10. Non-numeric / missing refs sort last, then by
             // string for a stable order.
             .sorted { lhs, rhs in
-                let l = lhs.ref.flatMap { Int($0) } ?? Int.max
-                let r = rhs.ref.flatMap { Int($0) } ?? Int.max
+                let l = lhs.holeNumber ?? Int.max
+                let r = rhs.holeNumber ?? Int.max
                 if l != r { return l < r }
                 return (lhs.ref ?? "") < (rhs.ref ?? "")
             }
