@@ -307,6 +307,22 @@ private final class HolePinAnnotation: NSObject, MKAnnotation {
     }
 }
 
+/// Par/distance text label beneath a hole's tee (e.g. "Par 4 · 410y"). We draw
+/// it ourselves rather than lean on the tee marker's native `title`: MapKit
+/// renders a marker's floating title in a separate layer that ignores the
+/// annotation view's `alphaValue`, so the native title can't be dimmed in step
+/// with the rest of the hole's markers. Owning it lets `emphasisAlpha` fade it.
+private final class HoleTitleAnnotation: NSObject, MKAnnotation {
+    @objc dynamic var coordinate: CLLocationCoordinate2D
+    let osmIdentifier: Int64
+    let text: String
+    init(coordinate: CLLocationCoordinate2D, osmIdentifier: Int64, text: String) {
+        self.coordinate = coordinate
+        self.osmIdentifier = osmIdentifier
+        self.text = text
+    }
+}
+
 /// Numbered marker for a recorded shot on the active hole.
 private final class ShotAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
@@ -452,12 +468,18 @@ extension CourseMapView {
         private func nearestTee(to point: CGPoint, in map: MKMapView) -> HoleTeeAnnotation? {
             var best: (tee: HoleTeeAnnotation, distance: CGFloat)?
             for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
+                // The current hole's own tee is where you record your tee shot, so it
+                // isn't a hole-switch target — clicks there fall through to `addShot`.
+                if tee.osmIdentifier == currentHoleID { continue }
+                // The numbered glyph is billboarded: it floats a constant ~28pt above
+                // the ground tip regardless of camera pitch/zoom. Measuring the click
+                // against that screen-space glyph center (rather than a fixed upright
+                // rect) keeps the target reliable when the map is tilted into a hole.
                 let tip = map.convert(tee.coordinate, toPointTo: map)
-                // Balloon rises up from the coordinate tip: ~48pt wide, ~60pt tall.
-                let balloon = CGRect(x: tip.x - 24, y: tip.y - 56, width: 48, height: 60)
-                guard balloon.contains(point) else { continue }
-                let dx = point.x - tip.x, dy = point.y - tip.y
+                let glyphCenter = CGPoint(x: tip.x, y: tip.y - 28)
+                let dx = point.x - glyphCenter.x, dy = point.y - glyphCenter.y
                 let distance = (dx * dx + dy * dy).squareRoot()
+                guard distance <= 30 else { continue }
                 if best == nil || distance < best!.distance {
                     best = (tee, distance)
                 }
@@ -603,6 +625,18 @@ extension CourseMapView {
             onCameraMoved?(mapView.region)
         }
 
+        /// The app drives all marker emphasis itself (hole focus, the flag on the
+        /// current pin, dimming) and navigates on tap, so MapKit's built-in
+        /// annotation selection is unwanted: a selected `MKMarkerAnnotationView`
+        /// enlarges its balloon and lifts its glyph, which reads as a hole number
+        /// "shifting" vertically and — because nothing else deselects it — persists
+        /// as you move between holes. Immediately deselecting keeps every marker in
+        /// its resting layout, killing that shift at the source (the `dequeueMarker`
+        /// reset only catches recycled views, not one selected while on the map).
+        func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
+            mapView.deselectAnnotation(view.annotation, animated: false)
+        }
+
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let poly = overlay as? StyledPolygon {
                 let renderer = MKPolygonRenderer(polygon: poly)
@@ -708,6 +742,7 @@ extension CourseMapView {
                 $0 is CourseMarkerAnnotation
                     || $0 is HoleTeeAnnotation
                     || $0 is HolePinAnnotation
+                    || $0 is HoleTitleAnnotation
                     || $0 is NearbyCourseAnnotation
             }
             map.removeAnnotations(toRemove)
@@ -724,6 +759,11 @@ extension CourseMapView {
                                 osmIdentifier: hole.osmIdentifier,
                                 glyph: hole.ref ?? "",
                                 title: Self.holeTitle(hole)
+                            ))
+                            map.addAnnotation(HoleTitleAnnotation(
+                                coordinate: tee,
+                                osmIdentifier: hole.osmIdentifier,
+                                text: Self.holeTitle(hole)
                             ))
                         }
                         if let pin = coords.last, coords.count >= 2 {
@@ -840,6 +880,11 @@ extension CourseMapView {
                 view.glyphText = tee.glyph
                 view.displayPriority = .required
                 view.canShowCallout = true
+                // The par/distance text is drawn by our own `HoleTitleAnnotation`
+                // so it can be dimmed; MapKit's native marker title can't be, so
+                // suppress it here to avoid an un-dimmable duplicate.
+                view.titleVisibility = .hidden
+                view.subtitleVisibility = .hidden
                 view.alphaValue = emphasisAlpha(for: tee.osmIdentifier)
                 return view
 
@@ -869,6 +914,20 @@ extension CourseMapView {
                 layer.backgroundColor = (currentStyle?.color(.holes) ?? .systemBlue).cgColor
                 view.layer = layer
                 view.alphaValue = emphasisAlpha(for: pin.osmIdentifier)
+                return view
+
+            case let label as HoleTitleAnnotation:
+                let id = "holeTitle"
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: label, reuseIdentifier: id)
+                view.annotation = label
+                view.canShowCallout = false
+                view.displayPriority = .required
+                // Sit just below the tee marker's coordinate tip (positive y is down),
+                // where MapKit's native marker title used to float.
+                view.centerOffset = CGPoint(x: 0, y: 29)
+                view.image = holeTitleLabelImage(label.text)
+                view.alphaValue = emphasisAlpha(for: label.osmIdentifier)
                 return view
 
             case let shot as ShotAnnotation:
@@ -974,6 +1033,7 @@ extension CourseMapView {
                     switch annotation {
                     case let tee as HoleTeeAnnotation: holeID = tee.osmIdentifier
                     case let pin as HolePinAnnotation: holeID = pin.osmIdentifier
+                    case let label as HoleTitleAnnotation: holeID = label.osmIdentifier
                     default: continue
                     }
                     guard let view = map.view(for: annotation) else { continue }
@@ -1055,6 +1115,32 @@ extension CourseMapView {
             let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]
             let textSize = text.size(withAttributes: attrs)
             return CGSize(width: max(34, ceil(textSize.width) + 14), height: 20)
+        }
+
+        /// Renders a hole's "Par 4 · 410y" label the way MapKit's native marker
+        /// title looked — white text with a soft dark shadow for legibility over
+        /// imagery, no pill — so the whole-view `alphaValue` can dim it in step with
+        /// the hole's markers. Padding leaves room for the shadow blur.
+        private func holeTitleLabelImage(_ text: String) -> NSImage {
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.9)
+            shadow.shadowBlurRadius = 3
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: para,
+                .shadow: shadow
+            ]
+            let textSize = text.size(withAttributes: attrs)
+            let pad: CGFloat = 6
+            let size = CGSize(width: ceil(textSize.width) + pad * 2, height: ceil(textSize.height) + pad * 2)
+            return NSImage(size: size, flipped: false) { rect in
+                text.draw(in: rect.insetBy(dx: pad, dy: pad), withAttributes: attrs)
+                return true
+            }
         }
 
         // MARK: Region
