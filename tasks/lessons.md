@@ -222,3 +222,38 @@ Model to remember:
   `.mapOverlayLevel` in `ContentView`, not `drawOrder`.
 - **Feature layers** (turf) = the sorted `featureOverlay` loop at `.aboveRoads`, ordered
   by `drawOrder`.
+
+## MapKit (native MKMapView wrapper)
+
+### A single new annotation must NOT blanket-rebuild the whole annotation set (glyph flash)
+
+Recording a shot in Play mode made **every** glyph flash — the course pin, all hole
+tees, all pins, and all existing shots — not just the new shot. Root cause in
+`CourseMapView.Coordinator.syncAnnotations`: one hash-gated block whose hash folded in
+every shot's id+coordinate, so adding a shot changed the hash and ran:
+
+```swift
+let toRemove = map.annotations.filter { !($0 is MKUserLocation) }
+map.removeAnnotations(toRemove)   // course marker + ALL tees + ALL pins + ALL shots
+// …then re-add every one from scratch
+```
+
+MapKit recycles each annotation view during removal and serves a stale cached image for
+one render frame before the new one draws → visible flash across every glyph. The code's
+own comment ("these sets change only on course selection / nearby load, never per frame")
+was the wrong assumption — shots mutate per click.
+
+Fix: split the sync into two independently hash-gated phases:
+- `syncStaticAnnotations` — course marker, hole tees/pins, nearby flags. Its hash
+  EXCLUDES shots, so recording a shot leaves it untouched; it also removes only those
+  static annotation TYPES, not `map.annotations.filter { !($0 is MKUserLocation) }`.
+- `syncShotAnnotations` — reconciles shot markers + yardage pills INCREMENTALLY by shot
+  number: an existing annotation whose coordinate/label still matches is kept as-is (no
+  remove → no recycle → no flash); only genuinely new ones are added and stale ones
+  removed.
+
+> Same root cause as the SwiftUI-`Map` glyph-flash lesson: blanket `removeAnnotations` +
+> re-`addAnnotation` on any coordinate change recycles views and flashes. Whenever a
+> per-action mutation (a shot) shares a rebuild path with a per-selection set
+> (marker/tees/pins), give each its OWN hash gate and reconcile the frequently-changing
+> set incrementally instead of tearing both down together.

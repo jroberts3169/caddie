@@ -157,6 +157,27 @@ enum SidebarSelection: Hashable {
 /// ~16 decoded courses (tens of MB). Tunable here in one place.
 private let osmCacheCapacity = 16
 
+enum AppMode: String, CaseIterable {
+    case plan = "Plan"
+    case play = "Play"
+
+    /// SF Symbol shown in the toolbar toggle for this mode.
+    var symbol: String {
+        switch self {
+        case .plan: return "map"
+        case .play: return "figure.golf"
+        }
+    }
+
+    /// The mode this one toggles to.
+    var toggled: AppMode {
+        switch self {
+        case .plan: return .play
+        case .play: return .plan
+        }
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.osmFetcher) private var osmFetcher
@@ -176,7 +197,10 @@ struct ContentView: View {
     /// The sub-course currently shown, or `nil` when the displayed course is a single
     /// course (or, transiently, before its OSM data has loaded).
     @State private var activeSubCourseID: String?
-    @State private var cameraPosition: MapCameraPosition = .automatic
+    /// The region the map should frame. Tagged with an identity token so
+    /// re-selecting the same course re-frames it (an equal region would otherwise
+    /// be diffed as "no change"). `nil` until the first frame request.
+    @State private var regionRequest: MapRegionRequest?
     /// Cancellable handle for the progressive feature renderer (see `renderChunked`),
     /// so a new selection can stop a paint that is still in progress.
     @State private var featureRenderTask: Task<Void, Never>?
@@ -197,8 +221,26 @@ struct ContentView: View {
     /// address + city + country. `nil` while geocoding is in flight or if it fails,
     /// in which case the marker falls back to `displayedCourse.coordinate`.
     @State private var markerCoordinate: CLLocationCoordinate2D?
+    /// Owns the `CLLocationManager` so it stays retained for the view's lifetime;
+    /// without a strong reference the system permission prompt never appears.
+    @State private var locationManager = LocationManager()
+    /// Golf courses found within `nearbyRadiusMeters` of the person's location,
+    /// shown as markers on the map. Empty until a fix resolves.
+    @State private var nearbyCourses: [GolfCourse] = []
+    /// Whether the user is planning (browsing) or actively playing the course.
+    @State private var appMode: AppMode = .plan
+    /// The hole currently focused in the Play detail pane.
+    @State private var currentHoleIndex: Int = 0
+    /// Recorded shots keyed by hole OSM id, for the displayed course. Reset when a
+    /// new course is selected.
+    @State private var shotsByHole: [Int64: [Shot]] = [:]
+    /// Region the user has panned/zoomed to on the nearby map but not yet searched;
+    /// non-nil drives the "Search here" button. Cleared once a search runs.
+    @State private var pendingSearchRegion: MKCoordinateRegion?
 
-    private let cameraBounds = MapCameraBounds(minimumDistance: 200, maximumDistance: 8000)
+    /// Radius for the "courses near me" search: 50 miles in meters.
+    private static let nearbyRadiusMeters: CLLocationDistance = 80_467
+
     
     var body: some View {
         NavigationSplitView {
@@ -206,9 +248,22 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             courseMap
+                .inspector(isPresented: Binding(
+                    get: { appMode == .play && displayedCourse != nil },
+                    set: { if !$0 { appMode = .plan } }
+                )) {
+                    PlayDetailPane(
+                        holes: courseHoles,
+                        currentHoleIndex: $currentHoleIndex,
+                        shots: currentHoleShots,
+                        onClearShots: clearCurrentHoleShots,
+                        onUndoShot: undoLastShot
+                    )
+                }
         }
         .navigationTitle(displayedCourse?.name ?? "Caddie")
         .navigationSubtitle(displayedCourse.map { locationSubtitle(for: $0) ?? "" } ?? "")
+        .background(FullScreenToolbarAutoHide())
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
         .onChange(of: searchText) { _, newValue in
             if newValue.isEmpty {
@@ -222,6 +277,7 @@ struct ContentView: View {
         .onChange(of: selection) { _, newValue in
             guard let course = newValue?.course else {
                 markerCoordinate = nil
+                appMode = .plan
                 return
             }
             displayedCourse = course
@@ -239,9 +295,12 @@ struct ContentView: View {
             courseHoles = []
             displayedSubCourses = []
             activeSubCourseID = nil
+            currentHoleIndex = 0
+            shotsByHole = [:]
+            pendingSearchRegion = nil
             // Stop any progressive overlay render still painting the previous course.
             featureRenderTask?.cancel()
-            cameraPosition = .region(MKCoordinateRegion(
+            regionRequest = MapRegionRequest(region: MKCoordinateRegion(
                 center: course.coordinate,
                 latitudinalMeters: 2000,
                 longitudinalMeters: 2000
@@ -268,101 +327,186 @@ struct ContentView: View {
             applyOutline(from: osmCourse, for: course)
             applyFeatures(from: osmCourse, for: course)
         }
+        .task {
+            // Resolve the person's location once, find golf courses within 50 miles,
+            // and frame the map so every marker (and the user dot) is visible.
+            guard displayedCourse == nil,
+                  let coordinate = await locationManager.currentCoordinate() else { return }
+            await loadNearbyCourses(around: coordinate)
+        }
+        .toolbar {
+            if displayedCourse != nil {
+                ToolbarItem(placement: .navigation) {
+                    Button {
+                        appMode = appMode.toggled
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: appMode.symbol)
+                                .frame(width: 16)
+                            Text(appMode.rawValue)
+                                .fixedSize()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                    }
+                    .help("Switch to \(appMode.toggled.rawValue) mode")
+                }
+            }
+            if displayedSubCourses.count > 1 {
+                ToolbarItem(placement: .navigation) {
+                    Menu {
+                        Button {
+                            activeSubCourseID = nil
+                        } label: {
+                            HStack {
+                                Text("All")
+                                if activeSubCourseID == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                        Divider()
+                        ForEach(displayedSubCourses) { sub in
+                            Button {
+                                activeSubCourseID = sub.id
+                            } label: {
+                                HStack {
+                                    Text(subCourseLabel(sub))
+                                    if activeSubCourseID == sub.id {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "flag")
+                                .frame(width: 16)
+                            Text(activeSubCourseLabel)
+                                .fixedSize()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                    }
+                    .menuStyle(.button)
+                }
+            }
+        }
+    }
+
+    private var activeSubCourseLabel: String {
+        guard let id = activeSubCourseID,
+              let sub = displayedSubCourses.first(where: { $0.id == id }) else {
+            return "All"
+        }
+        return subCourseLabel(sub)
+    }
+
+    /// OSM id of the hole currently focused in the Play pane, or `nil` if none.
+    private var currentHoleID: Int64? {
+        guard courseHoles.indices.contains(currentHoleIndex) else { return nil }
+        return courseHoles[currentHoleIndex].osmIdentifier
+    }
+
+    /// Shots recorded on the currently focused hole.
+    private var currentHoleShots: [Shot] {
+        guard let id = currentHoleID else { return [] }
+        return shotsByHole[id] ?? []
+    }
+
+    /// Appends a shot at `coordinate` to the currently focused hole.
+    private func addShotToCurrentHole(_ coordinate: CLLocationCoordinate2D) {
+        guard let id = currentHoleID else { return }
+        shotsByHole[id, default: []].append(Shot(coordinate: coordinate))
+    }
+
+    /// Removes every shot on the currently focused hole.
+    private func clearCurrentHoleShots() {
+        guard let id = currentHoleID else { return }
+        shotsByHole[id] = nil
+    }
+
+    /// Removes the most recently recorded shot on the currently focused hole, e.g.
+    /// in response to cmd+z. No-op when the hole has no shots.
+    private func undoLastShot() {
+        guard let id = currentHoleID, var holeShots = shotsByHole[id], !holeShots.isEmpty else { return }
+        holeShots.removeLast()
+        shotsByHole[id] = holeShots.isEmpty ? nil : holeShots
+    }
+
+    /// Switches the Play focus to the hole with the given OSM id, e.g. when its
+    /// tee marker is tapped on the map.
+    private func selectHole(withID id: Int64) {
+        guard let index = courseHoles.firstIndex(where: { $0.osmIdentifier == id }) else { return }
+        currentHoleIndex = index
     }
 
     private var courseMap: some View {
-        Map(position: $cameraPosition, bounds: cameraBounds) {
-            // Pinned to `.aboveLabels` (the top overlay level, same as holes) so
-            // the outline draws above the translucent turf fills at `.aboveRoads`
-            // — otherwise edge-hugging rough composites over it (e.g. Pebble Beach).
-            if overlay.isVisible(.boundary) {
-                ForEach(courseOutlines.indices, id: \.self) { i in
-                    MapPolygon(coordinates: courseOutlines[i])
-                        .foregroundStyle(.gray.opacity(0.0))
-                        .stroke(overlay.color(for: .boundary), lineWidth: 3)
-                        .mapOverlayLevel(level: .aboveLabels)
-                }
+        CourseMapView(
+            outlines: courseOutlines,
+            features: courseFeatures,
+            holes: courseHoles,
+            displayedCourse: displayedCourse,
+            courseMarkerCoordinate: markerCoordinate,
+            nearbyCourses: nearbyCourses,
+            style: mapStyleConfig,
+            regionRequest: regionRequest,
+            shots: currentHoleShots,
+            currentHole: courseHoles.indices.contains(currentHoleIndex) ? courseHoles[currentHoleIndex] : nil,
+            isPlayMode: appMode == .play && displayedCourse != nil,
+            onAddShot: addShotToCurrentHole,
+            onSelectHole: selectHole(withID:),
+            onCameraMoved: { region in
+                // Offer a re-search only while browsing the nearby map (no course
+                // open) — panning around an opened course shouldn't prompt it.
+                guard displayedCourse == nil else { return }
+                pendingSearchRegion = region
             }
-            ForEach(courseFeatures, id: \.osmIdentifier) { feature in
-                featureOverlay(feature)
-            }
-            // Drawn last so the dashed hole centerlines sit on top of the
-            // fairway/green fills rather than being composited under them.
-            if overlay.isVisible(.holes) {
-                ForEach(courseHoles, id: \.osmIdentifier) { hole in
-                    holeOverlay(hole)
-                }
-            }
-            if let displayedCourse {
-                Marker(displayedCourse.name, coordinate: markerCoordinate ?? displayedCourse.coordinate)
-            }
+        )
+        .ignoresSafeArea()
+        .overlay(alignment: .bottom) {
+            searchHereButton
         }
-        .mapStyle(MapStyle.imagery(elevation: .realistic))
         .overlay(alignment: .center) {
             loadingBanner
         }
-        .overlay(alignment: .bottom) {
-            subCoursePicker
-        }
     }
 
-    /// Map overlay for a single OSM feature: filled polygon for closed areas
-    /// (greens, bunkers, water…), stroked line for open paths. Pinned to the
-    /// `.aboveRoads` level so the hole centerlines (drawn at `.aboveLabels`) stay
-    /// on top of these fills.
-    @MapContentBuilder
-    func featureOverlay(_ feature: OSMFeature) -> some MapContent {
-        let layer = OverlayLayer.forFeature(feature.kind)
-        if overlay.isVisible(layer) {
-            let coords = feature.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-            let color = overlay.color(for: layer)
-            if feature.isClosed, coords.count >= 3 {
-                MapPolygon(coordinates: coords)
-                    .foregroundStyle(color.opacity(0.55))
-                    .stroke(color, lineWidth: 1)
-                    .mapOverlayLevel(level: .aboveRoads)
-            } else if coords.count >= 2 {
-                MapPolyline(coordinates: coords)
-                    .stroke(color, lineWidth: 2)
-                    .mapOverlayLevel(level: .aboveRoads)
-            }
+    /// "Search this area" pill shown near the top of the nearby map after the user
+    /// pans or zooms, so results can be refreshed for the region now in view.
+    /// Rendered unconditionally and driven by opacity so its subtree is never
+    /// inserted/removed adjacent to the Map view.
+    private var searchHereButton: some View {
+        let region = pendingSearchRegion
+        return Button {
+            if let region { Task { await searchHere(in: region) } }
+        } label: {
+            Label("Search this area", systemImage: "arrow.trianglehead.clockwise")
+                .font(.callout.weight(.medium))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
         }
+        .buttonStyle(.plain)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.separator))
+        .shadow(radius: 4, y: 2)
+        .padding(.top, 12)
+        .opacity(region != nil ? 1 : 0)
+        .animation(.easeInOut(duration: 0.2), value: region != nil)
+        .allowsHitTesting(region != nil)
     }
 
-    /// Map overlay for a single hole: the tee→green centerline plus a numbered
-    /// marker at the tee carrying par/length detail.
-    @MapContentBuilder
-    func holeOverlay(_ hole: OSMHole) -> some MapContent {
-        let holeColor = overlay.color(for: .holes)
-        let coords = hole.coordinates.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
-        if coords.count >= 2 {
-            MapPolyline(coordinates: coords)
-                .stroke(holeColor, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
-                .mapOverlayLevel(level: .aboveLabels)
+    /// Flattens the `@Observable` `OverlaySettings` into a value-type snapshot the
+    /// `CourseMapView` representable can diff. Reading `overlay` here (in the view
+    /// body) is what registers the dependency, so a Settings change re-renders.
+    private var mapStyleConfig: MapStyleConfig {
+        var colors: [OverlayLayer: NSColorBox] = [:]
+        var visible: [OverlayLayer: Bool] = [:]
+        for layer in OverlayLayer.allCases {
+            colors[layer] = NSColorBox(color: NSColor(overlay.color(for: layer)))
+            visible[layer] = overlay.isVisible(layer)
         }
-        if let tee = coords.first {
-            Marker(holeMarkerTitle(hole), coordinate: tee)
-                .tint(holeColor)
-        }
-
-        if let pin = coords.last {
-            Annotation("", coordinate: pin) {
-                Circle()
-                    .fill(holeColor)
-                    .frame(width: 9, height: 9)
-            }
-        }
-    }
-
-    /// Compact hole label, e.g. "3 · Par 4 · 410y".
-    private func holeMarkerTitle(_ hole: OSMHole) -> String {
-        var parts: [String] = []
-        if let ref = hole.ref, !ref.isEmpty { parts.append(ref) }
-        if let par = hole.par { parts.append("Par \(par)") }
-        if let meters = hole.lengthMeters {
-            parts.append("\(Int((meters * 1.09361).rounded()))y")
-        }
-        return parts.isEmpty ? "Hole" : parts.joined(separator: " · ")
+        return MapStyleConfig(colors: colors, visible: visible)
     }
 
     /// Subtle, non-blocking progress chip shown while the displayed course's data is
@@ -382,27 +526,6 @@ struct ContentView: View {
         .opacity(isLoadingDisplayed ? 1 : 0)
         .animation(.easeInOut(duration: 0.2), value: isLoadingDisplayed)
         .allowsHitTesting(false)
-    }
-
-    /// Floating segmented control for switching between a facility's sub-courses
-    /// (e.g. Balboa Park's Championship / Executive). Hidden for ordinary single
-    /// courses. Mirrors — and is kept in sync with — the sidebar disclosure.
-    @ViewBuilder
-    private var subCoursePicker: some View {
-        if displayedSubCourses.count > 1 {
-            Picker("Course", selection: $activeSubCourseID) {
-                Text("All").tag(String?.none)
-                ForEach(displayedSubCourses) { sub in
-                    Text(subCourseLabel(sub)).tag(sub.id as String?)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .padding(8)
-            .background(.regularMaterial, in: Capsule())
-            .padding(.bottom, 16)
-        }
     }
 
     /// Compact label for a sub-course segment: the name with a trailing
@@ -766,37 +889,126 @@ struct ContentView: View {
         let search = MKLocalSearch(request: request)
         guard let response = try? await search.start() else { return }
 
-        let results = response.mapItems.map { item in
-            let representations = item.addressRepresentations
-            let coordinate = item.location.coordinate
-            let cityName = representations?.cityName ?? ""
-            // `cityWithContext(.short)` yields e.g. "Pebble Beach, CA"; peel off the
-            // leading city to isolate the state/region for separate display.
-            let cityContext = representations?.cityWithContext(.short) ?? ""
-            let state: String
-            if !cityName.isEmpty, cityContext.hasPrefix(cityName + ", ") {
-                state = String(cityContext.dropFirst(cityName.count + 2))
-            } else {
-                state = ""
-            }
-            return GolfCourse(
-                identifier: item.url?.absoluteString ?? UUID().uuidString,
-                name: item.name ?? "Unknown",
-                address: item.address?.shortAddress ?? item.address?.fullAddress ?? "",
-                city: cityName,
-                state: state,
-                country: representations?.regionName ?? "",
-                countryCode: representations?.region?.identifier ?? "",
-                phone: item.phoneNumber ?? "",
-                website: item.url?.absoluteString ?? "",
-                latitude: coordinate.latitude,
-                longitude: coordinate.longitude
-            )
-        }
+        let results = response.mapItems.map(golfCourse(from:))
 
         await MainActor.run {
             searchResults = results
         }
+    }
+
+    /// Converts an `MKMapItem` from a local search into the app's `GolfCourse`,
+    /// peeling the state/region out of the formatted city context. Shared by the
+    /// text search and the nearby search.
+    private func golfCourse(from item: MKMapItem) -> GolfCourse {
+        let representations = item.addressRepresentations
+        let coordinate = item.location.coordinate
+        let cityName = representations?.cityName ?? ""
+        // `cityWithContext(.short)` yields e.g. "Pebble Beach, CA"; peel off the
+        // leading city to isolate the state/region for separate display.
+        let cityContext = representations?.cityWithContext(.short) ?? ""
+        let state: String
+        if !cityName.isEmpty, cityContext.hasPrefix(cityName + ", ") {
+            state = String(cityContext.dropFirst(cityName.count + 2))
+        } else {
+            state = ""
+        }
+        return GolfCourse(
+            identifier: item.url?.absoluteString ?? UUID().uuidString,
+            name: item.name ?? "Unknown",
+            address: item.address?.shortAddress ?? item.address?.fullAddress ?? "",
+            city: cityName,
+            state: state,
+            country: representations?.regionName ?? "",
+            countryCode: representations?.region?.identifier ?? "",
+            phone: item.phoneNumber ?? "",
+            website: item.url?.absoluteString ?? "",
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+    }
+
+    /// Runs a golf-course `MKLocalSearch` over a ~100-mile box around `center`,
+    /// keeps the results inside the 50-mile radius (local search biases toward the
+    /// region but doesn't hard-clip it), and frames the map so every marker and the
+    /// user dot are visible.
+    private func loadNearbyCourses(around center: CLLocationCoordinate2D) async {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = "golf course"
+        request.resultTypes = [.pointOfInterest]
+        request.pointOfInterestFilter = MKPointOfInterestFilter(including: [.golf])
+        request.region = MKCoordinateRegion(
+            center: center,
+            latitudinalMeters: Self.nearbyRadiusMeters * 2,
+            longitudinalMeters: Self.nearbyRadiusMeters * 2
+        )
+
+        let search = MKLocalSearch(request: request)
+        guard let response = try? await search.start() else { return }
+
+        let origin = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        func distance(_ course: GolfCourse) -> CLLocationDistance {
+            origin.distance(from: CLLocation(latitude: course.latitude, longitude: course.longitude))
+        }
+        let courses = response.mapItems
+            .map(golfCourse(from:))
+            .filter { distance($0) <= Self.nearbyRadiusMeters }
+            .sorted { distance($0) < distance($1) }
+
+        nearbyCourses = courses
+
+        // Frame everything: all course markers plus the user's own location.
+        guard displayedCourse == nil else { return }
+        regionRequest = MapRegionRequest(region: regionFitting(courses.map(\.coordinate) + [center]))
+    }
+
+    /// Re-runs the golf-course search over the region the user has panned/zoomed
+    /// to, replacing the nearby markers with what's in view. Unlike the initial
+    /// search it does *not* re-frame the camera — the user is already looking at
+    /// the area they want — and it uses the visible span (not the fixed 50-mile
+    /// radius) so results match what's on screen.
+    private func searchHere(in region: MKCoordinateRegion) async {
+        pendingSearchRegion = nil
+
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = "golf course"
+        request.resultTypes = [.pointOfInterest]
+        request.pointOfInterestFilter = MKPointOfInterestFilter(including: [.golf])
+        request.region = region
+
+        let search = MKLocalSearch(request: request)
+        guard let response = try? await search.start() else { return }
+
+        let origin = CLLocation(latitude: region.center.latitude, longitude: region.center.longitude)
+        nearbyCourses = response.mapItems
+            .map(golfCourse(from:))
+            .sorted {
+                origin.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude))
+                    < origin.distance(from: CLLocation(latitude: $1.latitude, longitude: $1.longitude))
+            }
+    }
+
+    /// Builds an `MKCoordinateRegion` that encloses every coordinate with a little
+    /// padding so edge markers aren't clipped. Enforces a minimum span so a single
+    /// (or tightly clustered) set of markers doesn't zoom in to street level.
+    private func regionFitting(_ coordinates: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+        guard let first = coordinates.first else {
+            return MKCoordinateRegion(.world)
+        }
+        var minLat = first.latitude, maxLat = first.latitude
+        var minLon = first.longitude, maxLon = first.longitude
+        for c in coordinates.dropFirst() {
+            minLat = min(minLat, c.latitude); maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude); maxLon = max(maxLon, c.longitude)
+        }
+        let center = CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLon + maxLon) / 2
+        )
+        let span = MKCoordinateSpan(
+            latitudeDelta: max((maxLat - minLat) * 1.3, 0.05),
+            longitudeDelta: max((maxLon - minLon) * 1.3, 0.05)
+        )
+        return MKCoordinateRegion(center: center, span: span)
     }
 
     var courseSidebar: some View {
@@ -883,7 +1095,7 @@ struct ContentView: View {
                 activeSubCourseID = nil
             } label: {
                 HStack {
-                    Label("All Courses", systemImage: "square.stack")
+                    Label("All", systemImage: "square.stack")
                         .font(.subheadline)
                         .lineLimit(1)
                     Spacer()
