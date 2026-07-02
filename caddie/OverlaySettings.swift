@@ -125,8 +125,11 @@ enum OverlayLayer: String, CaseIterable, Identifiable {
 final class OverlaySettings {
     private var colorOverrides: [OverlayLayer: Color] = [:]
     private var visibilityOverrides: [OverlayLayer: Bool] = [:]
+    var showMapLabels: Bool = true
 
     @ObservationIgnored private let defaults: UserDefaults
+
+    private static let showMapLabelsKey = "overlay.showMapLabels"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -137,6 +140,9 @@ final class OverlaySettings {
             if defaults.object(forKey: Self.visibilityKey(layer)) != nil {
                 visibilityOverrides[layer] = defaults.bool(forKey: Self.visibilityKey(layer))
             }
+        }
+        if defaults.object(forKey: Self.showMapLabelsKey) != nil {
+            showMapLabels = defaults.bool(forKey: Self.showMapLabelsKey)
         }
     }
 
@@ -158,6 +164,11 @@ final class OverlaySettings {
         defaults.set(visible, forKey: Self.visibilityKey(layer))
     }
 
+    func setShowMapLabels(_ show: Bool) {
+        showMapLabels = show
+        defaults.set(show, forKey: Self.showMapLabelsKey)
+    }
+
     /// Clears every override so all layers revert to their shipped defaults.
     func resetToDefaults() {
         for layer in OverlayLayer.allCases {
@@ -166,6 +177,8 @@ final class OverlaySettings {
             defaults.removeObject(forKey: Self.colorKey(layer))
             defaults.removeObject(forKey: Self.visibilityKey(layer))
         }
+        showMapLabels = true
+        defaults.removeObject(forKey: Self.showMapLabelsKey)
     }
 
     func colorBinding(for layer: OverlayLayer) -> Binding<Color> {
@@ -174,6 +187,10 @@ final class OverlaySettings {
 
     func visibilityBinding(for layer: OverlayLayer) -> Binding<Bool> {
         Binding(get: { self.isVisible(layer) }, set: { self.setVisible($0, for: layer) })
+    }
+
+    var showMapLabelsBinding: Binding<Bool> {
+        Binding(get: { self.showMapLabels }, set: { self.setShowMapLabels($0) })
     }
 
     private static func colorKey(_ layer: OverlayLayer) -> String { "overlay.color.\(layer.rawValue)" }

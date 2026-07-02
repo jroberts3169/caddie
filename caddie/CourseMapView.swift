@@ -119,6 +119,7 @@ enum Geo {
 struct MapStyleConfig: Equatable {
     var colors: [OverlayLayer: NSColorBox]
     var visible: [OverlayLayer: Bool]
+    var showMapLabels: Bool
 
     func color(_ layer: OverlayLayer) -> NSColor { colors[layer]?.color ?? .white }
     func isVisible(_ layer: OverlayLayer) -> Bool { visible[layer] ?? true }
@@ -416,6 +417,7 @@ extension CourseMapView {
         ) {
             currentHoleID = currentHole?.osmIdentifier
             let segments = shotSegments(shots: shots, currentHole: currentHole)
+            syncMapConfiguration(map: map, style: style)
             syncOverlays(
                 map: map,
                 outlines: outlines,
@@ -438,6 +440,18 @@ extension CourseMapView {
             )
             applyFraming(map: map, framingRequest: framingRequest)
             updateHoleEmphasis(map: map)
+        }
+
+        /// Applies map-level configuration (e.g. POI label filter) when the style changes.
+        private var currentShowMapLabels: Bool?
+
+        private func syncMapConfiguration(map: MKMapView, style: MapStyleConfig) {
+            guard style.showMapLabels != currentShowMapLabels else { return }
+            currentShowMapLabels = style.showMapLabels
+            if let config = map.preferredConfiguration as? MKHybridMapConfiguration {
+                config.pointOfInterestFilter = style.showMapLabels ? nil : .excludingAll
+                map.preferredConfiguration = config
+            }
         }
 
         // MARK: Clicks
