@@ -399,6 +399,9 @@ extension CourseMapView {
         /// as it settles its initial region on launch; suppressing reports until
         /// after our first framing keeps that from popping the "Search here" button.
         private var hasFramedOnce = false
+        /// Whether a course-footprint zoom-out ceiling is currently installed on the
+        /// map, so it can be lifted exactly once when the course is closed.
+        private var courseZoomCeilingApplied = false
 
         // MARK: Sync entry point
 
@@ -438,7 +441,14 @@ extension CourseMapView {
                 shots: shots,
                 segments: segments
             )
-            applyFraming(map: map, framingRequest: framingRequest)
+            applyFraming(map: map, framingRequest: framingRequest, courseIsOpen: displayedCourse != nil)
+            // Drop the zoom-out ceiling once no course is open, so the nearby browse
+            // map is freely zoomable again. (Setting it is done in `applyFraming`,
+            // where the freshly-applied footprint distance is known.)
+            if displayedCourse == nil, courseZoomCeilingApplied {
+                map.setCameraZoomRange(nil, animated: false)
+                courseZoomCeilingApplied = false
+            }
             updateHoleEmphasis(map: map)
         }
 
@@ -1258,7 +1268,7 @@ extension CourseMapView {
 
         // MARK: Region
 
-        private func applyFraming(map: MKMapView, framingRequest: MapFramingRequest?) {
+        private func applyFraming(map: MKMapView, framingRequest: MapFramingRequest?, courseIsOpen: Bool) {
             guard let request = framingRequest, request.id != appliedRegionID else { return }
             appliedRegionID = request.id
             // Animate only short hops; a long cross-country jump animated would make
@@ -1281,6 +1291,19 @@ extension CourseMapView {
                 // Draw the full-course overview straight at its final framing rather
                 // than animating a zoom-in to it — the pull-back/zoom read as awkward.
                 map.setRegion(region, animated: false)
+                if courseIsOpen {
+                    // Cap how far out the user can zoom while a course is open: 1.5× the
+                    // distance MapKit chose for this footprint framing. This leaves a
+                    // little breathing room for context without letting the map zoom
+                    // past the course out into the wider world. Read from the camera
+                    // *after* `setRegion` so it reflects the just-applied footprint.
+                    let ceiling = map.camera.centerCoordinateDistance * 1.5
+                    map.setCameraZoomRange(
+                        MKMapView.CameraZoomRange(maxCenterCoordinateDistance: ceiling),
+                        animated: false
+                    )
+                    courseZoomCeilingApplied = true
+                }
             case let .camera(center, distance, pitch, heading):
                 // `fromDistance` is centerCoordinateDistance (camera→look-at point),
                 // NOT altitude — passing an altitude here would snap the camera far
