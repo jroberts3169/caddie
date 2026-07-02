@@ -13,7 +13,7 @@ struct OverlaySettingsView: View {
     var body: some View {
         Form {
             Section("Map") {
-                Toggle("Show Map Labels", isOn: settings.showMapLabelsBinding)
+                Toggle("Show Points of Interest", isOn: settings.showMapLabelsBinding)
                     .toggleStyle(.switch)
             }
 
