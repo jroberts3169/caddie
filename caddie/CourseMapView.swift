@@ -119,6 +119,7 @@ enum Geo {
 struct MapStyleConfig: Equatable {
     var colors: [OverlayLayer: NSColorBox]
     var visible: [OverlayLayer: Bool]
+    var showMapLabels: Bool
 
     func color(_ layer: OverlayLayer) -> NSColor { colors[layer]?.color ?? .white }
     func isVisible(_ layer: OverlayLayer) -> Bool { visible[layer] ?? true }
@@ -398,6 +399,13 @@ extension CourseMapView {
         /// as it settles its initial region on launch; suppressing reports until
         /// after our first framing keeps that from popping the "Search here" button.
         private var hasFramedOnce = false
+        /// Whether a course-footprint zoom-out ceiling is currently installed on the
+        /// map, so it can be lifted exactly once when the course is closed.
+        private var courseZoomCeilingApplied = false
+        /// True while a course is open and the camera boundary is pinned to its
+        /// footprint, so the user can't pan away from the course out into the wider
+        /// world. Cleared (boundary removed) when the course closes.
+        private var courseCameraBoundaryApplied = false
 
         // MARK: Sync entry point
 
@@ -416,6 +424,7 @@ extension CourseMapView {
         ) {
             currentHoleID = currentHole?.osmIdentifier
             let segments = shotSegments(shots: shots, currentHole: currentHole)
+            syncMapConfiguration(map: map, style: style)
             syncOverlays(
                 map: map,
                 outlines: outlines,
@@ -436,8 +445,33 @@ extension CourseMapView {
                 shots: shots,
                 segments: segments
             )
-            applyFraming(map: map, framingRequest: framingRequest)
+            applyFraming(map: map, framingRequest: framingRequest, courseIsOpen: displayedCourse != nil)
+            // Drop the zoom-out ceiling and pan boundary once no course is open, so
+            // the nearby browse map is freely pannable/zoomable again. (Both are set
+            // in `applyFraming`, where the freshly-applied footprint is known.)
+            if displayedCourse == nil {
+                if courseZoomCeilingApplied {
+                    map.setCameraZoomRange(nil, animated: false)
+                    courseZoomCeilingApplied = false
+                }
+                if courseCameraBoundaryApplied {
+                    map.setCameraBoundary(nil, animated: false)
+                    courseCameraBoundaryApplied = false
+                }
+            }
             updateHoleEmphasis(map: map)
+        }
+
+        /// Applies map-level configuration (e.g. POI label filter) when the style changes.
+        private var currentShowMapLabels: Bool?
+
+        private func syncMapConfiguration(map: MKMapView, style: MapStyleConfig) {
+            guard style.showMapLabels != currentShowMapLabels else { return }
+            currentShowMapLabels = style.showMapLabels
+            if let config = map.preferredConfiguration as? MKHybridMapConfiguration {
+                config.pointOfInterestFilter = style.showMapLabels ? nil : .excludingAll
+                map.preferredConfiguration = config
+            }
         }
 
         // MARK: Clicks
@@ -1244,7 +1278,7 @@ extension CourseMapView {
 
         // MARK: Region
 
-        private func applyFraming(map: MKMapView, framingRequest: MapFramingRequest?) {
+        private func applyFraming(map: MKMapView, framingRequest: MapFramingRequest?, courseIsOpen: Bool) {
             guard let request = framingRequest, request.id != appliedRegionID else { return }
             appliedRegionID = request.id
             // Animate only short hops; a long cross-country jump animated would make
@@ -1264,9 +1298,53 @@ extension CourseMapView {
             isApplyingRegion = true
             switch request.framing {
             case let .topDown(region):
+                // Clear any constraints left over from a previously-open course
+                // BEFORE framing. Switching straight from course A to course B never
+                // passes through the `displayedCourse == nil` cleanup, so A's pan
+                // boundary/zoom ceiling would otherwise still be active here and
+                // MapKit would clamp this `setRegion` back toward A's footprint —
+                // landing the map near the previously-selected course.
+                if courseCameraBoundaryApplied {
+                    map.setCameraBoundary(nil, animated: false)
+                    courseCameraBoundaryApplied = false
+                }
+                if courseZoomCeilingApplied {
+                    map.setCameraZoomRange(nil, animated: false)
+                    courseZoomCeilingApplied = false
+                }
                 // Draw the full-course overview straight at its final framing rather
                 // than animating a zoom-in to it — the pull-back/zoom read as awkward.
                 map.setRegion(region, animated: false)
+                if courseIsOpen {
+                    // Cap how far out the user can zoom while a course is open: 1.5× the
+                    // distance MapKit chose for this footprint framing. This leaves a
+                    // little breathing room for context without letting the map zoom
+                    // past the course out into the wider world. Read from the camera
+                    // *after* `setRegion` so it reflects the just-applied footprint.
+                    let ceiling = map.camera.centerCoordinateDistance * 1.5
+                    map.setCameraZoomRange(
+                        MKMapView.CameraZoomRange(maxCenterCoordinateDistance: ceiling),
+                        animated: false
+                    )
+                    courseZoomCeilingApplied = true
+                    // Lock panning to the course footprint. The boundary constrains
+                    // the camera's *center* to this region, so the user can nudge to
+                    // the edges for context but can't pan the course off-screen out
+                    // into the surrounding world. Widen the framing region slightly
+                    // so the boundary allows the full footprint to be centered even
+                    // after the little zoom-out headroom above.
+                    let bounded = MKCoordinateRegion(
+                        center: region.center,
+                        span: MKCoordinateSpan(
+                            latitudeDelta: region.span.latitudeDelta * 1.5,
+                            longitudeDelta: region.span.longitudeDelta * 1.5
+                        )
+                    )
+                    if let boundary = MKMapView.CameraBoundary(coordinateRegion: bounded) {
+                        map.setCameraBoundary(boundary, animated: false)
+                        courseCameraBoundaryApplied = true
+                    }
+                }
             case let .camera(center, distance, pitch, heading):
                 // `fromDistance` is centerCoordinateDistance (camera→look-at point),
                 // NOT altitude — passing an altitude here would snap the camera far

@@ -12,6 +12,11 @@ struct OverlaySettingsView: View {
 
     var body: some View {
         Form {
+            Section("Map") {
+                Toggle("Show Points of Interest", isOn: settings.showMapLabelsBinding)
+                    .toggleStyle(.switch)
+            }
+
             Section {
                 ForEach(OverlayLayer.structureLayers) { overlayRow($0) }
             } header: {

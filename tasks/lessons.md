@@ -257,3 +257,15 @@ Fix: split the sync into two independently hash-gated phases:
 > per-action mutation (a shot) shares a rebuild path with a per-selection set
 > (marker/tees/pins), give each its OWN hash gate and reconcile the frequently-changing
 > set incrementally instead of tearing both down together.
+
+## Zoom-out ceiling: use MKMapView.setCameraZoomRange, not setRegion snap-back
+
+To cap how far the user can zoom out (e.g. keep them within a selected course),
+do NOT try to detect over-zoom in `regionDidChangeAnimated` and call `setRegion`
+to snap  reentrant region sets from inside that delegate callback areback 
+unreliable/ignored and fight the user's gesture. Instead install a native
+`MKMapView.CameraZoomRange(maxCenterCoordinateDistance:)` via
+`map.setCameraZoomRange(_:animated:)`. Compute the max distance by reading
+`map.camera.centerCoordinateDistance` right AFTER the footprint `setRegion` (so
+it reflects the applied framing) and multiply for headroom. Clear it with
+`setCameraZoomRange(nil, animated:false)` when no course is open.
