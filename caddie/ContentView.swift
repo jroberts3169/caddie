@@ -260,6 +260,11 @@ struct ContentView: View {
     /// non-nil drives the "Search here" button. Cleared once a search runs.
     @State private var pendingSearchRegion: MKCoordinateRegion?
 
+    #if DEBUG
+    /// Whether the developer JSON inspector panel is shown (DEBUG builds only).
+    @State private var showDataInspector = false
+    #endif
+
     /// Radius for the "courses near me" search: 50 miles in meters.
     private static let nearbyRadiusMeters: CLLocationDistance = 80_467
 
@@ -270,17 +275,8 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 300)
         } detail: {
             courseMap
-                .inspector(isPresented: Binding(
-                    get: { appMode == .play && displayedCourse != nil },
-                    set: { if !$0 { appMode = .plan } }
-                )) {
-                    PlayDetailPane(
-                        holes: courseHoles,
-                        currentHoleIndex: $currentHoleIndex,
-                        shots: currentHoleShots,
-                        onClearShots: clearCurrentHoleShots,
-                        onUndoShot: undoLastShot
-                    )
+                .inspector(isPresented: inspectorPresented) {
+                    inspectorContent
                 }
         }
         .navigationTitle(displayedCourse?.name ?? "Caddie")
@@ -506,6 +502,22 @@ struct ContentView: View {
                     .accessibilityValue(activeSubCourseLabel)
                 }
             }
+            #if DEBUG
+            if displayedCourse != nil {
+                ToolbarItem(placement: .automatic) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showDataInspector.toggle()
+                        }
+                    } label: {
+                        Image(systemName: "curlybraces")
+                    }
+                    .keyboardShortcut("j", modifiers: [.command, .shift])
+                    .help("Toggle the JSON data inspector")
+                    .accessibilityIdentifier("dataInspectorToggle")
+                }
+            }
+            #endif
         }
     }
 
@@ -603,8 +615,69 @@ struct ContentView: View {
         }
     }
 
-    /// "Search this area" pill shown near the top of the nearby map after the user
-    /// pans or zooms, so results can be refreshed for the region now in view.
+    /// Whether the trailing inspector is open, and the binding that closes it. The
+    /// Play detail pane owns the inspector normally; in DEBUG the data inspector can
+    /// also open it (taking precedence), so both presentations funnel through here.
+    private var inspectorPresented: Binding<Bool> {
+        Binding(
+            get: {
+                #if DEBUG
+                if showDataInspector { return true }
+                #endif
+                return appMode == .play && displayedCourse != nil
+            },
+            set: { open in
+                if !open {
+                    #if DEBUG
+                    showDataInspector = false
+                    #endif
+                    appMode = .plan
+                }
+            }
+        )
+    }
+
+    /// The trailing inspector's content: the DEBUG data inspector when toggled,
+    /// otherwise the Play detail pane.
+    @ViewBuilder
+    private var inspectorContent: some View {
+        #if DEBUG
+        if showDataInspector {
+            DevDataInspectorPanel(
+                sources: devInspectorSources,
+                isPresented: $showDataInspector
+            )
+        } else {
+            playDetailInspector
+        }
+        #else
+        playDetailInspector
+        #endif
+    }
+
+    private var playDetailInspector: some View {
+        PlayDetailPane(
+            holes: courseHoles,
+            currentHoleIndex: $currentHoleIndex,
+            shots: currentHoleShots,
+            onClearShots: clearCurrentHoleShots,
+            onUndoShot: undoLastShot
+        )
+    }
+
+    #if DEBUG
+    /// Encodable snapshots offered to the JSON inspector: the built `OSMCourse` (when
+    /// loaded) and the lightweight `GolfCourse` metadata for the displayed course.
+    private var devInspectorSources: [DevInspectorSource] {
+        guard let course = displayedCourse else { return [] }
+        var sources: [DevInspectorSource] = []
+        if let osm = osmCache[course.identifier] {
+            sources.append(DevInspectorSource(name: "OSM Course", osm))
+        }
+        sources.append(DevInspectorSource(name: "Metadata", course))
+        return sources
+    }
+    #endif
     /// Rendered unconditionally and driven by opacity so its subtree is never
     /// inserted/removed adjacent to the Map view.
     private var searchHereButton: some View {
