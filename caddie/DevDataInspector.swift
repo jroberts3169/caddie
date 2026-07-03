@@ -184,6 +184,15 @@ struct DevInspectorSource: Identifiable {
     }
 }
 
+/// Reference-type memo for a view's encoded inspector sources. Held in `@State` so
+/// the expensive `DevInspectorSource` encoding survives `body` re-evaluations and
+/// only reruns when `key` changes. A class (not a value) so mutating it during a
+/// `body` read doesn't invalidate the view and cause a re-render loop.
+final class InspectorSourceCache {
+    var key: String = ""
+    var sources: [DevInspectorSource] = []
+}
+
 /// The resizable trailing dev panel: source picker, search, tree, and a footer of
 /// tree/clipboard actions.
 struct DevDataInspectorPanel: View {

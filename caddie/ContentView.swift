@@ -263,6 +263,12 @@ struct ContentView: View {
     #if DEBUG
     /// Whether the developer JSON inspector panel is shown (DEBUG builds only).
     @State private var showDataInspector = false
+    /// Memoizes the encoded inspector sources. Building a `DevInspectorSource`
+    /// JSON-encodes the entire OSM course (every feature and coordinate), so doing
+    /// it inside `body` re-encodes the whole course on every re-render — and map
+    /// hover/pan/zoom rebuild `body` constantly. Cache by a cheap course key so the
+    /// encoding runs once per course load instead of once per frame.
+    @State private var inspectorSourceCache = InspectorSourceCache()
     #endif
 
     /// Radius for the "courses near me" search: 50 miles in meters.
@@ -668,13 +674,25 @@ struct ContentView: View {
     #if DEBUG
     /// Encodable snapshots offered to the JSON inspector: the built `OSMCourse` (when
     /// loaded) and the lightweight `GolfCourse` metadata for the displayed course.
+    /// Memoized via `inspectorSourceCache`: encoding the full OSM course is expensive
+    /// and this is read from `body`, which re-evaluates on every map interaction.
     private var devInspectorSources: [DevInspectorSource] {
         guard let course = displayedCourse else { return [] }
+        let osm = osmCache[course.identifier]
+        // OSM data for a given identifier is immutable once loaded, so the course
+        // identifier plus "is the OSM payload present yet" fully captures when the
+        // encoded sources need to change.
+        let key = "\(course.identifier)|\(osm != nil)"
+        if inspectorSourceCache.key == key {
+            return inspectorSourceCache.sources
+        }
         var sources: [DevInspectorSource] = []
-        if let osm = osmCache[course.identifier] {
+        if let osm {
             sources.append(DevInspectorSource(name: "OSM Course", osm))
         }
         sources.append(DevInspectorSource(name: "Metadata", course))
+        inspectorSourceCache.key = key
+        inspectorSourceCache.sources = sources
         return sources
     }
     #endif
