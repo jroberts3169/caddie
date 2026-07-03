@@ -362,6 +362,13 @@ private final class ShotYardageAnnotation: NSObject, MKAnnotation {
 
 extension CourseMapView {
     final class Coordinator: NSObject, MKMapViewDelegate, NSGestureRecognizerDelegate {
+        /// The pin glyph is identical for every flag marker (tint is applied
+        /// per-view via `markerTintColor`), so look the SF Symbol up once instead
+        /// of re-allocating it on every `viewFor` call during pan/zoom.
+        private static let flagGlyph = NSImage(
+            systemSymbolName: "flag.fill", accessibilityDescription: nil
+        )
+
         weak var map: MKMapView?
         /// Called with the clicked coordinate while in Play mode.
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
@@ -981,7 +988,7 @@ extension CourseMapView {
             case let course as CourseMarkerAnnotation:
                 let view = dequeueMarker(mapView, id: "courseMarker", for: course)
                 view.markerTintColor = .systemRed
-                view.glyphImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: nil)
+                view.glyphImage = Self.flagGlyph
                 view.displayPriority = .required
                 view.canShowCallout = true
                 return view
@@ -989,7 +996,7 @@ extension CourseMapView {
             case let nearby as NearbyCourseAnnotation:
                 let view = dequeueMarker(mapView, id: "nearbyCourse", for: nearby)
                 view.markerTintColor = .systemGreen
-                view.glyphImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: nil)
+                view.glyphImage = Self.flagGlyph
                 view.displayPriority = .required
                 view.canShowCallout = true
                 return view
@@ -1009,30 +1016,17 @@ extension CourseMapView {
                 return view
 
             case let pin as HolePinAnnotation:
-                if isPlayMode && pin.osmIdentifier == currentHoleID {
-                    // Focused hole: flag on the standard balloon marker.
-                    let view = dequeueMarker(mapView, id: "holePinFlag", for: pin)
-                    view.markerTintColor = currentStyle?.color(.holes) ?? .systemBlue
-                    view.glyphImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: nil)
-                    view.displayPriority = .required
-                    view.canShowCallout = false
-                    view.alphaValue = 1
-                    return view
-                }
-                // Other holes: small disc.
-                let id = "holePin"
-                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
-                    ?? MKAnnotationView(annotation: pin, reuseIdentifier: id)
-                view.annotation = pin
+                // Every hole's pin is the same native marker; focus is conveyed by
+                // opacity and display priority, both mutated in place by
+                // `updateHoleEmphasis`. Keeping one view class (never swapping a
+                // balloon marker for a disc) means changing holes never has to
+                // remove+re-add the pin, so the marker stays anchored instead of
+                // flashing when clicking through holes quickly.
+                let view = dequeueMarker(mapView, id: "holePin", for: pin)
+                view.markerTintColor = currentStyle?.color(.holes) ?? .systemBlue
+                view.glyphImage = Self.flagGlyph
                 view.canShowCallout = false
-                let size: CGFloat = 9
-                view.frame = NSRect(x: 0, y: 0, width: size, height: size)
-                view.wantsLayer = true
-                let layer = view.layer ?? CALayer()
-                layer.frame = view.bounds
-                layer.cornerRadius = size / 2
-                layer.backgroundColor = (currentStyle?.color(.holes) ?? .systemBlue).cgColor
-                view.layer = layer
+                view.displayPriority = pinDisplayPriority(for: pin.osmIdentifier)
                 view.alphaValue = emphasisAlpha(for: pin.osmIdentifier)
                 return view
 
@@ -1115,6 +1109,13 @@ extension CourseMapView {
             return view
         }
 
+        /// Whether `holeID` is the hole currently focused in Play mode. The single
+        /// source of truth for "is this the active hole" so the pin's flag/priority
+        /// styling in `viewFor` and `updateHoleEmphasis` can't drift apart.
+        private func isFocused(holeID: Int64) -> Bool {
+            isPlayMode && holeID == currentHoleID
+        }
+
         /// Opacity a hole's tee/pin marker should render at. In Play mode every hole
         /// other than the focused one is dimmed so the active hole stands out; in
         /// Plan mode (or before a hole is chosen) all markers are fully opaque. A
@@ -1125,6 +1126,13 @@ extension CourseMapView {
             return 0.3
         }
 
+        /// Display priority a hole's pin should render at. The focused hole's pin
+        /// outranks the rest so it wins any MapKit declutter. Single source of truth
+        /// so `viewFor` and `updateHoleEmphasis` can't rank pins differently.
+        private func pinDisplayPriority(for holeID: Int64) -> MKFeatureDisplayPriority {
+            isFocused(holeID: holeID) ? .required : .defaultHigh
+        }
+
         /// Re-applies `emphasisAlpha` to the tee/pin views already on the map, and
         /// refreshes each pin's flag/disc styling. MapKit only calls `viewFor` on
         /// add/recycle, so when the focused hole changes (advancing holes, switching
@@ -1132,33 +1140,36 @@ extension CourseMapView {
         /// place. Fades so the change reads as a deliberate emphasis shift rather
         /// than a pop.
         private func updateHoleEmphasis(map: MKMapView) {
-            // A pin's view CLASS depends on whether it's the focused hole (balloon
-            // flag marker vs. plain disc). MapKit caches the last view it built, so a
-            // hole change needs the stale pin views re-materialized to pick up the
-            // right class. Remove+re-add only the pins whose kind actually changed.
-            let staleFlags = map.annotations.compactMap { annotation -> HolePinAnnotation? in
-                guard let pin = annotation as? HolePinAnnotation,
-                      let view = map.view(for: pin) else { return nil }
-                let wantsFlag = isPlayMode && pin.osmIdentifier == currentHoleID
-                let hasFlag = view is MKMarkerAnnotationView
-                return wantsFlag != hasFlag ? pin : nil
-            }
-            if !staleFlags.isEmpty {
-                map.removeAnnotations(staleFlags)
-                map.addAnnotations(staleFlags)
-            }
+            // Every hole marker is a persistent native view — the pin no longer
+            // swaps view class on focus — so a hole change is a pure in-place
+            // update: fade each marker's opacity and re-rank the pins' display
+            // priority. Nothing is removed or re-added, so the markers stay
+            // anchored instead of flashing when clicking through holes quickly.
+            //
+            // Only the hole markers (tee, pin, title) participate in emphasis, so
+            // filter to them once up front — the animation loop never touches the
+            // unrelated views (shots, yardage pills, course/nearby flags, the
+            // user-location dot), and `map.view(for:)` is only paid per hole marker.
+            let holeMarkers: [(annotation: MKAnnotation, holeID: Int64)] =
+                map.annotations.compactMap { annotation in
+                    switch annotation {
+                    case let tee as HoleTeeAnnotation: return (tee, tee.osmIdentifier)
+                    case let pin as HolePinAnnotation: return (pin, pin.osmIdentifier)
+                    case let label as HoleTitleAnnotation: return (label, label.osmIdentifier)
+                    default: return nil
+                    }
+                }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.25
                 context.allowsImplicitAnimation = true
-                for annotation in map.annotations {
-                    let holeID: Int64
-                    switch annotation {
-                    case let tee as HoleTeeAnnotation: holeID = tee.osmIdentifier
-                    case let pin as HolePinAnnotation: holeID = pin.osmIdentifier
-                    case let label as HoleTitleAnnotation: holeID = label.osmIdentifier
-                    default: continue
-                    }
+                for (annotation, holeID) in holeMarkers {
                     guard let view = map.view(for: annotation) else { continue }
+                    // The focused hole's pin outranks the rest so it wins any MapKit
+                    // declutter; priority isn't animatable, so set it directly.
+                    if annotation is HolePinAnnotation,
+                       let marker = view as? MKMarkerAnnotationView {
+                        marker.displayPriority = pinDisplayPriority(for: holeID)
+                    }
                     let target = emphasisAlpha(for: holeID)
                     if view.alphaValue != target {
                         view.animator().alphaValue = target
