@@ -502,8 +502,8 @@ extension CourseMapView {
 
             guard isPlayMode else { return }
 
-            if let tee = nearestTee(to: point, in: map) {
-                onSelectHole?(tee.osmIdentifier)
+            if let holeID = nearestHoleMarker(to: point, in: map) {
+                onSelectHole?(holeID)
                 return
             }
             // Clicks landing on any other annotation glyph (course pin, shot marker)
@@ -552,62 +552,77 @@ extension CourseMapView {
             updateHoleEmphasis(map: map)
         }
 
-        /// The OSM id of the hole whose tee glyph is nearest `point` (within its
-        /// hit rect), or `nil` if the mouse is over no marker.
+        /// The OSM id of the hole whose tee OR pin glyph is nearest `point` (within
+        /// its hit rect), or `nil` if the mouse is over no marker. Both a hole's tee
+        /// marker and its pin marker preview the same hole, so either one lifts it.
         private func hoveredHole(at point: CGPoint, in map: MKMapView) -> Int64? {
             var best: (id: Int64, distance: CGFloat)?
-            for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
-                let rect = teeHitRect(for: tee, in: map)
-                guard rect.contains(point) else { continue }
+            func consider(_ annotation: MKAnnotation, holeID: Int64) {
+                let rect = markerHitRect(for: annotation, in: map)
+                guard rect.contains(point) else { return }
                 let dx = point.x - rect.midX, dy = point.y - rect.midY
                 let distance = (dx * dx + dy * dy).squareRoot()
                 if best == nil || distance < best!.distance {
-                    best = (tee.osmIdentifier, distance)
+                    best = (holeID, distance)
                 }
+            }
+            for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
+                consider(tee, holeID: tee.osmIdentifier)
+            }
+            for pin in map.annotations.compactMap({ $0 as? HolePinAnnotation }) {
+                consider(pin, holeID: pin.osmIdentifier)
             }
             return best?.id
         }
 
-        /// Screen-space hit rect for a tee's balloon glyph, in the map's coordinate
-        /// space. Prefers the annotation view's ACTUAL frame — MapKit positions and
-        /// billboards that view at a constant screen size regardless of camera
-        /// pitch/zoom, so its frame is reliable where a geometrically-estimated glyph
-        /// center is not — padded outward for an easier target. Falls back to a
-        /// balloon rect anchored at the projected coordinate tip when the view isn't
-        /// materialized (off-screen, or not yet drawn after an add).
-        private func teeHitRect(for tee: HoleTeeAnnotation, in map: MKMapView) -> CGRect {
+        /// Screen-space hit rect for a marker's balloon glyph, in the map's
+        /// coordinate space. Prefers the annotation view's ACTUAL frame — MapKit
+        /// positions and billboards that view at a constant screen size regardless
+        /// of camera pitch/zoom, so its frame is reliable where a
+        /// geometrically-estimated glyph center is not — padded outward for an
+        /// easier target. Falls back to a balloon rect anchored at the projected
+        /// coordinate tip when the view isn't materialized (off-screen, or not yet
+        /// drawn after an add).
+        private func markerHitRect(for annotation: MKAnnotation, in map: MKMapView) -> CGRect {
             let pad: CGFloat = 14
-            if let view = map.view(for: tee) {
+            if let view = map.view(for: annotation) {
                 return view.frame.insetBy(dx: -pad, dy: -pad)
             }
             // MKMarkerAnnotationView balloon: ~40pt wide, tip at bottom-center,
             // rising ~52pt above the tip.
-            let tip = map.convert(tee.coordinate, toPointTo: map)
+            let tip = map.convert(annotation.coordinate, toPointTo: map)
             return CGRect(x: tip.x - 20, y: tip.y - 52, width: 40, height: 52)
                 .insetBy(dx: -pad, dy: -pad)
         }
 
-        /// The tee annotation whose balloon glyph contains `point`, or `nil` if the
-        /// click missed every tee. When balloons overlap, the one whose hit rect
+        /// The OSM id of the hole whose tee OR pin glyph contains `point`, or `nil`
+        /// if the click missed every hole marker. A hole's tee and its pin both
+        /// switch focus to that hole. When markers overlap, the one whose hit rect
         /// center is nearest the click wins (not the first in iteration order).
-        private func nearestTee(to point: CGPoint, in map: MKMapView) -> HoleTeeAnnotation? {
-            var best: (tee: HoleTeeAnnotation, distance: CGFloat)?
-            for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
-                // The current hole's own tee is where you record your tee shot, so it
-                // isn't a hole-switch target — clicks there fall through to `addShot`.
-                if tee.osmIdentifier == currentHoleID { continue }
+        private func nearestHoleMarker(to point: CGPoint, in map: MKMapView) -> Int64? {
+            var best: (id: Int64, distance: CGFloat)?
+            func consider(_ annotation: MKAnnotation, holeID: Int64) {
+                // The current hole's own markers are where you record shots, so they
+                // aren't a hole-switch target — clicks there fall through to `addShot`.
+                if holeID == currentHoleID { return }
                 // Hit-test against the marker's actual rendered frame (see
-                // `teeHitRect`), which stays accurate when the map is tilted into a
-                // hole where a geometric glyph-center estimate drifts.
-                let rect = teeHitRect(for: tee, in: map)
-                guard rect.contains(point) else { continue }
+                // `markerHitRect`), which stays accurate when the map is tilted into
+                // a hole where a geometric glyph-center estimate drifts.
+                let rect = markerHitRect(for: annotation, in: map)
+                guard rect.contains(point) else { return }
                 let dx = point.x - rect.midX, dy = point.y - rect.midY
                 let distance = (dx * dx + dy * dy).squareRoot()
                 if best == nil || distance < best!.distance {
-                    best = (tee, distance)
+                    best = (holeID, distance)
                 }
             }
-            return best?.tee
+            for tee in map.annotations.compactMap({ $0 as? HoleTeeAnnotation }) {
+                consider(tee, holeID: tee.osmIdentifier)
+            }
+            for pin in map.annotations.compactMap({ $0 as? HolePinAnnotation }) {
+                consider(pin, holeID: pin.osmIdentifier)
+            }
+            return best?.id
         }
 
         /// The nearby-course flag whose balloon glyph contains `point`, or `nil` if
@@ -1116,14 +1131,14 @@ extension CourseMapView {
             isPlayMode && holeID == currentHoleID
         }
 
-        /// Opacity a hole's tee/pin marker should render at. In Play mode every hole
-        /// other than the focused one is dimmed so the active hole stands out; in
-        /// Plan mode (or before a hole is chosen) all markers are fully opaque. A
-        /// hovered hole is also lifted to full opacity so it can be previewed.
+        // Opacity a hole's tee/pin marker should render at. In Play mode every
+        // hole other than the focused one is dimmed so the active hole stands 
+        // out; in Plan mode (or before a hole is chosen) all markers are fully 
+        // opaque. A hovered hole is also lifted to full opacity so it can be previewed.
         private func emphasisAlpha(for holeID: Int64) -> CGFloat {
             guard isPlayMode, let current = currentHoleID else { return 1 }
             if holeID == current || holeID == hoveredHoleID { return 1 }
-            return 0.3
+            return 0.35
         }
 
         /// Display priority a hole's pin should render at. The focused hole's pin
