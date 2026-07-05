@@ -22,18 +22,43 @@ nonisolated enum ShotYardage {
         tee: CLLocationCoordinate2D?,
         shots: [CLLocationCoordinate2D]
     ) -> [Int?] {
-        var result: [Int?] = []
+        meters(tee: tee, shots: shots).map { meters in
+            meters.map { Int(($0 * yardsPerMeter).rounded()) }
+        }
+    }
+
+    /// Straight-line distance in metres for each shot, parallel to `shots`, using
+    /// the same segment logic as `yards`: shot 1 is measured from `tee` when
+    /// available, every later shot from the previous shot. `nil` when there's no
+    /// reference point yet. The unit-agnostic source both `yards` and the metric
+    /// display path derive from.
+    static func meters(
+        tee: CLLocationCoordinate2D?,
+        shots: [CLLocationCoordinate2D]
+    ) -> [Double?] {
+        var result: [Double?] = []
         var previous: CLLocationCoordinate2D? = tee
         for shot in shots {
             if let from = previous {
                 let meters = CLLocation(latitude: from.latitude, longitude: from.longitude)
                     .distance(from: CLLocation(latitude: shot.latitude, longitude: shot.longitude))
-                result.append(Int((meters * yardsPerMeter).rounded()))
+                result.append(meters)
             } else {
                 result.append(nil)
             }
             previous = shot
         }
         return result
+    }
+
+    /// Formats a metre distance for display, honoring the user's unit preference.
+    /// `metric` → whole metres with an `m` suffix; otherwise whole yards with a `y`
+    /// suffix. `separator` sits between the number and the unit (`""` for the map's
+    /// compact "410y" pills, `" "` for the inspector's "410 y" rows).
+    static func distanceLabel(meters: Double, metric: Bool, separator: String = "") -> String {
+        if metric {
+            return "\(Int(meters.rounded()))\(separator)m"
+        }
+        return "\(Int((meters * yardsPerMeter).rounded()))\(separator)y"
     }
 }

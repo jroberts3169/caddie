@@ -126,10 +126,13 @@ final class OverlaySettings {
     private var colorOverrides: [OverlayLayer: Color] = [:]
     private var visibilityOverrides: [OverlayLayer: Bool] = [:]
     var showMapLabels: Bool = true
+    /// When `true`, hole distances are shown in metres; otherwise in yards.
+    var useMetricDistance: Bool = false
 
     @ObservationIgnored private let defaults: UserDefaults
 
     private static let showMapLabelsKey = "overlay.showMapLabels"
+    private static let useMetricDistanceKey = "overlay.useMetricDistance"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -143,6 +146,9 @@ final class OverlaySettings {
         }
         if defaults.object(forKey: Self.showMapLabelsKey) != nil {
             showMapLabels = defaults.bool(forKey: Self.showMapLabelsKey)
+        }
+        if defaults.object(forKey: Self.useMetricDistanceKey) != nil {
+            useMetricDistance = defaults.bool(forKey: Self.useMetricDistanceKey)
         }
     }
 
@@ -169,6 +175,11 @@ final class OverlaySettings {
         defaults.set(show, forKey: Self.showMapLabelsKey)
     }
 
+    func setUseMetricDistance(_ useMetric: Bool) {
+        useMetricDistance = useMetric
+        defaults.set(useMetric, forKey: Self.useMetricDistanceKey)
+    }
+
     /// Clears every override so all layers revert to their shipped defaults.
     func resetToDefaults() {
         for layer in OverlayLayer.allCases {
@@ -179,6 +190,8 @@ final class OverlaySettings {
         }
         showMapLabels = true
         defaults.removeObject(forKey: Self.showMapLabelsKey)
+        useMetricDistance = false
+        defaults.removeObject(forKey: Self.useMetricDistanceKey)
     }
 
     func colorBinding(for layer: OverlayLayer) -> Binding<Color> {
@@ -191,6 +204,10 @@ final class OverlaySettings {
 
     var showMapLabelsBinding: Binding<Bool> {
         Binding(get: { self.showMapLabels }, set: { self.setShowMapLabels($0) })
+    }
+
+    var useMetricDistanceBinding: Binding<Bool> {
+        Binding(get: { self.useMetricDistance }, set: { self.setUseMetricDistance($0) })
     }
 
     private static func colorKey(_ layer: OverlayLayer) -> String { "overlay.color.\(layer.rawValue)" }

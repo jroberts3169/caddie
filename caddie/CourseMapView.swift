@@ -120,6 +120,7 @@ struct MapStyleConfig: Equatable {
     var colors: [OverlayLayer: NSColorBox]
     var visible: [OverlayLayer: Bool]
     var showMapLabels: Bool
+    var useMetricDistance: Bool
 
     func color(_ layer: OverlayLayer) -> NSColor { colors[layer]?.color ?? .white }
     func isVisible(_ layer: OverlayLayer) -> Bool { visible[layer] ?? true }
@@ -300,7 +301,9 @@ private final class HoleTeeAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
     let osmIdentifier: Int64
     let glyph: String
-    let title: String?
+    /// Par/distance callout text. Mutable so a units change can update it in place
+    /// without tearing down and re-adding the tee marker (which would flash).
+    var title: String?
     init(coordinate: CLLocationCoordinate2D, osmIdentifier: Int64, glyph: String, title: String?) {
         self.coordinate = coordinate
         self.osmIdentifier = osmIdentifier
@@ -327,7 +330,9 @@ private final class HolePinAnnotation: NSObject, MKAnnotation {
 private final class HoleTitleAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
     let osmIdentifier: Int64
-    let text: String
+    /// The rendered "Par 4 · 410y" string. Mutable so a units change can re-render
+    /// the label image in place without a remove/re-add flash.
+    var text: String
     init(coordinate: CLLocationCoordinate2D, osmIdentifier: Int64, text: String) {
         self.coordinate = coordinate
         self.osmIdentifier = osmIdentifier
@@ -348,7 +353,9 @@ private final class ShotAnnotation: NSObject, MKAnnotation {
 /// Small yardage pill anchored near a shot segment.
 private final class ShotYardageAnnotation: NSObject, MKAnnotation {
     @objc dynamic var coordinate: CLLocationCoordinate2D
-    let label: String
+    /// The rendered distance string ("410y"/"375m"). Mutable so a units change can
+    /// re-render the pill in place without a remove/re-add flash.
+    var label: String
     let shotNumber: Int
 
     init(coordinate: CLLocationCoordinate2D, label: String, shotNumber: Int) {
@@ -394,6 +401,11 @@ extension CourseMapView {
         /// Hash of the inputs that determine the static annotation set (course
         /// marker, hole tees/pins, nearby flags) — everything except shots.
         private var appliedStaticAnnotationHash: Int?
+        /// Hash of the inputs that determine the hole title label text (holes +
+        /// distance-unit preference). Kept separate from the static-annotation hash
+        /// so a units toggle updates the labels in place instead of rebuilding —
+        /// and flashing — every tee/pin/marker.
+        private var appliedHoleTitleHash: Int?
         /// Hash of the inputs that determine the shot annotation set.
         private var appliedShotAnnotationHash: Int?
         /// Identity of the last applied region request, so the same region can be
@@ -839,6 +851,7 @@ extension CourseMapView {
                 style: style
             )
             syncShotAnnotations(map: map, shots: shots, segments: segments)
+            syncHoleTitles(map: map, holes: holes, displayedCourse: displayedCourse, style: style)
         }
 
         /// Rebuilds the course marker, hole tees/pins, and nearby flags. This set
@@ -900,12 +913,12 @@ extension CourseMapView {
                                 coordinate: tee,
                                 osmIdentifier: hole.osmIdentifier,
                                 glyph: hole.displayGlyph,
-                                title: Self.holeTitle(hole)
+                                title: Self.holeTitle(hole, metric: style.useMetricDistance)
                             ))
                             map.addAnnotation(HoleTitleAnnotation(
                                 coordinate: tee,
                                 osmIdentifier: hole.osmIdentifier,
-                                text: Self.holeTitle(hole)
+                                text: Self.holeTitle(hole, metric: style.useMetricDistance)
                             ))
                         }
                         if let pin = coords.last, coords.count >= 2 {
@@ -920,6 +933,51 @@ extension CourseMapView {
                         coordinate: course.coordinate,
                         title: course.name
                     ))
+                }
+            }
+        }
+
+        /// Updates the par/distance label text (and tee callout title) in place when
+        /// the distance-unit preference changes, without removing or re-adding any
+        /// annotation. Rebuilding the static set on a units toggle would recycle the
+        /// tee/pin/marker views and flash them (MapKit hands back a stale cached image
+        /// for one frame during removal); mutating just the affected labels avoids it.
+        private func syncHoleTitles(
+            map: MKMapView,
+            holes: [OSMHole],
+            displayedCourse: GolfCourse?,
+            style: MapStyleConfig
+        ) {
+            guard displayedCourse != nil, style.isVisible(.holes) else { return }
+
+            var hasher = Hasher()
+            hasher.combine(style.useMetricDistance)
+            for h in holes { hasher.combine(h.osmIdentifier) }
+            let hash = hasher.finalize()
+            guard hash != appliedHoleTitleHash else { return }
+            appliedHoleTitleHash = hash
+
+            var titleByHole: [Int64: String] = [:]
+            for hole in holes {
+                titleByHole[hole.osmIdentifier] = Self.holeTitle(hole, metric: style.useMetricDistance)
+            }
+
+            for annotation in map.annotations {
+                switch annotation {
+                case let title as HoleTitleAnnotation:
+                    guard let newText = titleByHole[title.osmIdentifier], newText != title.text else { continue }
+                    title.text = newText
+                    // Re-render the label image on the live view so the change shows
+                    // without a remove/re-add. `view(for:)` is nil when the label is
+                    // off-screen/unrealized; the fresh `text` is used when it's next
+                    // dequeued, so nothing is lost.
+                    if let view = map.view(for: title) {
+                        view.image = holeTitleLabelImage(newText)
+                    }
+                case let tee as HoleTeeAnnotation:
+                    if let newText = titleByHole[tee.osmIdentifier] { tee.title = newText }
+                default:
+                    continue
                 }
             }
         }
@@ -942,8 +1000,9 @@ extension CourseMapView {
             }
             for seg in segments {
                 hasher.combine(seg.shotNumber)
-                hasher.combine(seg.yards)
+                hasher.combine(seg.meters)
             }
+            hasher.combine(currentStyle?.useMetricDistance ?? false)
             let hash = hasher.finalize()
             guard hash != appliedShotAnnotationHash else { return }
             appliedShotAnnotationHash = hash
@@ -969,17 +1028,30 @@ extension CourseMapView {
             let removeShots = Array(shotByNumber.values)
 
             // Same reconcile for the yardage pills, keyed by their shot number.
+            // A pill whose segment still sits at the same midpoint is KEPT even when
+            // its label changed (e.g. a yards↔metres units toggle): the text is
+            // updated in place and the live view re-rendered, so switching units
+            // never removes+re-adds the pill (which would flash). Only genuinely new
+            // or moved pills are added and stale ones removed.
             var yardageByNumber: [Int: ShotYardageAnnotation] = [:]
             for yardage in map.annotations.compactMap({ $0 as? ShotYardageAnnotation }) {
                 yardageByNumber[yardage.shotNumber] = yardage
             }
             var addYardage: [ShotYardageAnnotation] = []
+            let metric = currentStyle?.useMetricDistance ?? false
             for segment in segments {
-                let label = "\(segment.yards)y"
+                let label = ShotYardage.distanceLabel(meters: segment.meters, metric: metric)
                 if let existing = yardageByNumber[segment.shotNumber],
-                   existing.label == label,
                    existing.coordinate.latitude == segment.midpoint.latitude,
                    existing.coordinate.longitude == segment.midpoint.longitude {
+                    // Same pill position: keep it, updating the label in place if the
+                    // unit/text changed so no remove/re-add (and no flash) occurs.
+                    if existing.label != label {
+                        existing.label = label
+                        if let view = map.view(for: existing) {
+                            view.image = yardagePillImage(label)
+                        }
+                    }
                     yardageByNumber[segment.shotNumber] = nil
                 } else {
                     addYardage.append(ShotYardageAnnotation(
@@ -1075,31 +1147,35 @@ extension CourseMapView {
                 view.canShowCallout = false
                 view.displayPriority = .required
                 view.centerOffset = CGPoint(x: 0, y: -12)
-
-                let text = yardage.label
-                let pillSize = pillSizeForYardage(text)
-                let paraStyle = NSMutableParagraphStyle()
-                paraStyle.alignment = .center
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-                    .foregroundColor: NSColor.white,
-                    .paragraphStyle: paraStyle
-                ]
-                // Drawing handler renders at the target context's scale factor,
-                // so the pill is sharp on Retina displays without manual scaling.
-                let image = NSImage(size: pillSize, flipped: false) { rect in
-                    let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
-                    NSColor.black.withAlphaComponent(0.72).setFill()
-                    path.fill()
-                    let textRect = NSRect(x: 7, y: 3, width: rect.width - 14, height: rect.height - 6)
-                    text.draw(in: textRect, withAttributes: attrs)
-                    return true
-                }
-                view.image = image
+                view.image = yardagePillImage(yardage.label)
                 return view
 
             default:
                 return nil
+            }
+        }
+
+        /// Renders a shot-distance pill ("410y"/"375m") as a rounded dark capsule with
+        /// centered white text. Shared by `viewFor` (initial draw) and the in-place
+        /// units-toggle reconcile so both produce an identical image.
+        private func yardagePillImage(_ text: String) -> NSImage {
+            let pillSize = pillSizeForYardage(text)
+            let paraStyle = NSMutableParagraphStyle()
+            paraStyle.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paraStyle
+            ]
+            // Drawing handler renders at the target context's scale factor,
+            // so the pill is sharp on Retina displays without manual scaling.
+            return NSImage(size: pillSize, flipped: false) { rect in
+                let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+                NSColor.black.withAlphaComponent(0.72).setFill()
+                path.fill()
+                let textRect = NSRect(x: 7, y: 3, width: rect.width - 14, height: rect.height - 6)
+                text.draw(in: textRect, withAttributes: attrs)
+                return true
             }
         }
 
@@ -1206,24 +1282,14 @@ extension CourseMapView {
 
         /// Compact hole label, e.g. "Par 4 · 410y". Falls back to the
         /// coordinate-derived tee-to-pin distance when OSM lacks a length tag.
-        private static func holeTitle(_ hole: OSMHole) -> String {
+        /// `metric` switches the distance suffix between yards and metres.
+        private static func holeTitle(_ hole: OSMHole, metric: Bool) -> String {
             var parts: [String] = []
             if let par = hole.par { parts.append("Par \(par)") }
-            let meters = hole.lengthMeters ?? teeToGreenMeters(hole)
-            if let meters {
-                parts.append("\(Int((meters * 1.09361).rounded()))y")
+            if let meters = hole.effectiveLengthMeters {
+                parts.append(ShotYardage.distanceLabel(meters: meters, metric: metric))
             }
             return parts.isEmpty ? "Hole" : parts.joined(separator: " · ")
-        }
-
-        /// Straight-line tee-to-pin distance in metres, derived from the hole's
-        /// first and last coordinates. Returns `nil` when fewer than 2 points exist.
-        private static func teeToGreenMeters(_ hole: OSMHole) -> Double? {
-            guard hole.coordinates.count >= 2,
-                  let tee = hole.coordinates.first,
-                  let pin = hole.coordinates.last else { return nil }
-            return CLLocation(latitude: tee.lat, longitude: tee.lon)
-                .distance(from: CLLocation(latitude: pin.lat, longitude: pin.lon))
         }
 
         private struct ShotSegment {
@@ -1231,7 +1297,7 @@ extension CourseMapView {
             let from: CLLocationCoordinate2D
             let to: CLLocationCoordinate2D
             let midpoint: CLLocationCoordinate2D
-            let yards: Int
+            let meters: Double
         }
 
         /// Creates one segment per recorded shot. Shot 1 starts at the hole tee
@@ -1248,7 +1314,7 @@ extension CourseMapView {
                     previous = shot.coordinate
                     continue
                 }
-                let yards = Int((distanceMeters(from: from, to: shot.coordinate) * 1.09361).rounded())
+                let meters = distanceMeters(from: from, to: shot.coordinate)
                 let midpoint = CLLocationCoordinate2D(
                     latitude: (from.latitude + shot.coordinate.latitude) / 2,
                     longitude: (from.longitude + shot.coordinate.longitude) / 2
@@ -1258,7 +1324,7 @@ extension CourseMapView {
                     from: from,
                     to: shot.coordinate,
                     midpoint: midpoint,
-                    yards: yards
+                    meters: meters
                 ))
                 previous = shot.coordinate
             }

@@ -3,6 +3,7 @@
 //  caddie
 //
 
+import CoreLocation
 import Foundation
 
 nonisolated struct Coordinate: Codable, Hashable {
@@ -130,6 +131,19 @@ nonisolated struct OSMHole: Codable, Hashable {
     var displayGlyph: String {
         if let number = Self.parseRef(ref).number { return "\(number)" }
         return ref ?? ""
+    }
+
+    /// The hole's playing length in metres. Prefers the OSM `length`/`distance`
+    /// tag (`lengthMeters`); when that's absent, falls back to the straight-line
+    /// tee-to-pin distance derived from the first and last coordinates. `nil` when
+    /// neither a length tag nor at least two coordinates exist.
+    var effectiveLengthMeters: Double? {
+        if let lengthMeters { return lengthMeters }
+        guard coordinates.count >= 2,
+              let tee = coordinates.first,
+              let pin = coordinates.last else { return nil }
+        return CLLocation(latitude: tee.lat, longitude: tee.lon)
+            .distance(from: CLLocation(latitude: pin.lat, longitude: pin.lon))
     }
 }
 

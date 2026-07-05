@@ -728,7 +728,7 @@ struct ContentView: View {
             colors[layer] = NSColorBox(color: NSColor(overlay.color(for: layer)))
             visible[layer] = overlay.isVisible(layer)
         }
-        return MapStyleConfig(colors: colors, visible: visible, showMapLabels: overlay.showMapLabels)
+        return MapStyleConfig(colors: colors, visible: visible, showMapLabels: overlay.showMapLabels, useMetricDistance: overlay.useMetricDistance)
     }
 
     /// Subtle, non-blocking progress chip shown while the displayed course's data is
