@@ -67,9 +67,7 @@ struct PlayDetailPane: View {
 
                 Spacer()
 
-                Text(holeTitle)
-                    .font(.title2.bold())
-                    .accessibilityIdentifier("holeTitleLabel")
+                holeTitleMenu
 
                 Spacer()
 
@@ -197,6 +195,35 @@ struct PlayDetailPane: View {
 
     // MARK: - Subviews
 
+    private var holeTitleMenu: some View {
+        Menu {
+            ForEach(Array(holes.enumerated()), id: \.offset) { index, hole in
+                Button {
+                    currentHoleIndex = index
+                } label: {
+                    if index == currentHoleIndex {
+                        Label(holeMenuTitle(for: hole, at: index), systemImage: "checkmark")
+                    } else {
+                        Text(holeMenuTitle(for: hole, at: index))
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(holeTitle)
+                    .font(.title2.bold())
+                Image(systemName: "chevron.down")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .fixedSize()
+        .disabled(holes.isEmpty)
+        .accessibilityIdentifier("holeTitleMenu")
+    }
+
     private var holeTitle: String {
         guard !holes.isEmpty else { return "No Holes" }
         if let number = currentHole?.holeNumber {
@@ -206,6 +233,16 @@ struct PlayDetailPane: View {
             return "Hole \(ref)"
         }
         return "Hole \(currentHoleIndex + 1)"
+    }
+
+    private func holeMenuTitle(for hole: OSMHole, at index: Int) -> String {
+        if let number = hole.holeNumber {
+            return "Hole \(number)"
+        }
+        if let ref = hole.ref, !ref.isEmpty {
+            return "Hole \(ref)"
+        }
+        return "Hole \(index + 1)"
     }
 
     private func statRow(label: String, value: String) -> some View {
