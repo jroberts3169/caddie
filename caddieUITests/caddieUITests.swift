@@ -109,7 +109,7 @@ final class caddieUITests: XCTestCase {
     func testModeToggleShowsAndHidesPlayPane() throws {
         guard selectFirstCourse() else { return }
 
-        let holeTitle = app.staticTexts["holeTitleLabel"]
+        let holeTitle = app.descendants(matching: .any)["holeTitleMenu"].firstMatch
         XCTAssertFalse(
             holeTitle.exists,
             "The Play detail pane should be hidden while in Plan mode."
@@ -139,7 +139,7 @@ final class caddieUITests: XCTestCase {
 
         app.buttons["modeToggleButton"].click()
 
-        let holeTitle = app.staticTexts["holeTitleLabel"]
+        let holeTitle = app.descendants(matching: .any)["holeTitleMenu"].firstMatch
         XCTAssertTrue(
             holeTitle.waitForExistence(timeout: 10),
             "Entering Play mode should show the hole title."
@@ -147,9 +147,9 @@ final class caddieUITests: XCTestCase {
 
         // Holes load asynchronously from OSM; if this course has no parsed hole
         // geometry the title stays "No Holes" and there is nothing to navigate.
-        // NOTE: on macOS a SwiftUI `Text` surfaces its string as the element's
-        // accessibility *value* (AXValue), not its *label* — so all title checks
-        // here match on `value`, never `label` (which is empty).
+        // NOTE: the hole title is a Menu whose current selection is surfaced as the
+        // element's accessibility *value* (AXValue) via `.accessibilityValue` — so
+        // all title checks here match on `value`, never `label`.
         let hasHoles = NSPredicate(format: "value BEGINSWITH 'Hole '")
         let holesReady = expectation(for: hasHoles, evaluatedWith: holeTitle)
         let outcome = XCTWaiter().wait(for: [holesReady], timeout: 20)
@@ -383,11 +383,12 @@ final class caddieUITests: XCTestCase {
 
         app.buttons["modeToggleButton"].click()
 
-        let holeTitle = app.staticTexts["holeTitleLabel"]
+        let holeTitle = app.descendants(matching: .any)["holeTitleMenu"].firstMatch
         XCTAssertTrue(holeTitle.waitForExistence(timeout: 10))
 
         // Recording a shot only makes sense once hole geometry is present.
-        // (macOS surfaces the `Text` title as `value`, not `label`.)
+        // (The hole title Menu surfaces its selection as `value` via
+        // `.accessibilityValue`, not `label`.)
         let hasHoles = NSPredicate(format: "value BEGINSWITH 'Hole '")
         let holesReady = expectation(for: hasHoles, evaluatedWith: holeTitle)
         let outcome = XCTWaiter().wait(for: [holesReady], timeout: 20)

@@ -15,21 +15,23 @@ struct PlayDetailPane: View {
     let onClearShots: () -> Void
     let onUndoShot: () -> Void
 
+    @Environment(OverlaySettings.self) private var settings
+
     private var currentHole: OSMHole? {
         guard holes.indices.contains(currentHoleIndex) else { return nil }
         return holes[currentHoleIndex]
     }
 
-    /// Yardage for each shot, parallel to `shots`. Shot 1 is measured from the
-    /// hole tee (the hole's first coordinate) when available; every later shot is
-    /// measured from the previous shot. `nil` when there's no reference point yet
-    /// (e.g. shot 1 on a hole with no tee geometry). Mirrors the segment logic the
-    /// map uses to draw yardage pills so the two always agree.
-    private var shotYards: [Int?] {
+    /// Distance in metres for each shot, parallel to `shots`. Shot 1 is measured
+    /// from the hole tee (the hole's first coordinate) when available; every later
+    /// shot is measured from the previous shot. `nil` when there's no reference
+    /// point yet (e.g. shot 1 on a hole with no tee geometry). Mirrors the segment
+    /// logic the map uses to draw yardage pills so the two always agree.
+    private var shotDistances: [Double?] {
         let tee = currentHole?.coordinates.first.map {
             CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
         }
-        return ShotYardage.yards(tee: tee, shots: shots.map(\.coordinate))
+        return ShotYardage.meters(tee: tee, shots: shots.map(\.coordinate))
     }
 
     /// Whether there's an earlier/later hole to move to. Drives both the
@@ -91,9 +93,12 @@ struct PlayDetailPane: View {
             if let hole = currentHole {
                 VStack(spacing: 20) {
                     statRow(label: "Par", value: hole.par.map { "\($0)" } ?? "—")
-                    if let meters = hole.lengthMeters {
-                        statRow(label: "Yards", value: "\(Int((meters * 1.09361).rounded()))")
-                        statRow(label: "Meters", value: "\(Int(meters.rounded()))")
+                    if let meters = hole.effectiveLengthMeters {
+                        if settings.useMetricDistance {
+                            statRow(label: "Meters", value: "\(Int(meters.rounded()))")
+                        } else {
+                            statRow(label: "Yards", value: "\(Int((meters * ShotYardage.yardsPerMeter).rounded()))")
+                        }
                     }
                 }
                 .padding(20)
@@ -159,15 +164,15 @@ struct PlayDetailPane: View {
             } else {
                 ScrollView {
                     VStack(spacing: 0) {
-                        let yards = shotYards
+                        let distances = shotDistances
                         ForEach(Array(shots.enumerated()), id: \.element.id) { index, _ in
                             HStack {
                                 Image(systemName: "\(index + 1).circle.fill")
                                     .foregroundStyle(.orange)
                                 Text("Shot \(index + 1)")
                                 Spacer()
-                                if let yardage = yards[index] {
-                                    Text("\(yardage) yd")
+                                if let meters = distances[index] {
+                                    Text(ShotYardage.distanceLabel(meters: meters, metric: settings.useMetricDistance, separator: " "))
                                         .font(.subheadline)
                                         .foregroundStyle(.secondary)
                                         .monospacedDigit()
@@ -222,6 +227,7 @@ struct PlayDetailPane: View {
         .fixedSize()
         .disabled(holes.isEmpty)
         .accessibilityIdentifier("holeTitleMenu")
+        .accessibilityValue(holeTitle)
     }
 
     private var holeTitle: String {

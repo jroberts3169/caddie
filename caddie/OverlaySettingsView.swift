@@ -15,6 +15,8 @@ struct OverlaySettingsView: View {
             Section("Map") {
                 Toggle("Show Points of Interest", isOn: settings.showMapLabelsBinding)
                     .toggleStyle(.switch)
+                Toggle("Use Metric Distances", isOn: settings.useMetricDistanceBinding)
+                    .toggleStyle(.switch)
             }
 
             Section {
