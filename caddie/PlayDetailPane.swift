@@ -32,18 +32,37 @@ struct PlayDetailPane: View {
         return ShotYardage.yards(tee: tee, shots: shots.map(\.coordinate))
     }
 
+    /// Whether there's an earlier/later hole to move to. Drives both the
+    /// header chevrons and the arrow-key shortcuts.
+    private var canGoToPreviousHole: Bool {
+        !holes.isEmpty && currentHoleIndex > 0
+    }
+
+    private var canGoToNextHole: Bool {
+        !holes.isEmpty && currentHoleIndex < holes.count - 1
+    }
+
+    private func goToPreviousHole() {
+        if canGoToPreviousHole { currentHoleIndex -= 1 }
+    }
+
+    private func goToNextHole() {
+        if canGoToNextHole { currentHoleIndex += 1 }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // ── Hole navigation header ──────────────────────────────────────
             HStack {
-                Button {
-                    if currentHoleIndex > 0 { currentHoleIndex -= 1 }
-                } label: {
+                Button(action: goToPreviousHole) {
                     Image(systemName: "chevron.left")
                         .imageScale(.large)
+                        .frame(width: 44, height: 44)
+                        .background(.quaternary, in: Circle())
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .disabled(currentHoleIndex == 0 || holes.isEmpty)
+                .disabled(!canGoToPreviousHole)
                 .accessibilityIdentifier("holePrevButton")
 
                 Spacer()
@@ -54,14 +73,15 @@ struct PlayDetailPane: View {
 
                 Spacer()
 
-                Button {
-                    if currentHoleIndex < holes.count - 1 { currentHoleIndex += 1 }
-                } label: {
+                Button(action: goToNextHole) {
                     Image(systemName: "chevron.right")
                         .imageScale(.large)
+                        .frame(width: 44, height: 44)
+                        .background(.quaternary, in: Circle())
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .disabled(currentHoleIndex >= holes.count - 1 || holes.isEmpty)
+                .disabled(!canGoToNextHole)
                 .accessibilityIdentifier("holeNextButton")
             }
             .padding(.horizontal, 16)
@@ -100,6 +120,17 @@ struct PlayDetailPane: View {
             Button("Undo Shot", action: onUndoShot)
                 .keyboardShortcut("z", modifiers: .command)
                 .disabled(shots.isEmpty)
+                .hidden()
+        }
+        .background {
+            // Hidden ←/→ handlers: step to the previous/next hole in Play mode.
+            Button("Previous Hole", action: goToPreviousHole)
+                .keyboardShortcut(.leftArrow, modifiers: [])
+                .disabled(!canGoToPreviousHole)
+                .hidden()
+            Button("Next Hole", action: goToNextHole)
+                .keyboardShortcut(.rightArrow, modifiers: [])
+                .disabled(!canGoToNextHole)
                 .hidden()
         }
     }
