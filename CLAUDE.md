@@ -68,7 +68,7 @@ with the pattern
 ## Platform & Design Standards
 
 - **Apple HIG First**: All design and architecture decisions MUST align with Apple's current Human Interface Guidelines (https://developer.apple.com/design/human-interface-guidelines/). Prefer native patterns, controls, and metaphors — do not invent custom equivalents when a system-provided one exists.
-- **macOS 26 SDKs & APIs**: Always target and prefer the latest macOS 26 APIs. Use new framework additions over deprecated or legacy alternatives. Never reach for an older API when a modern replacement exists in the SDK.
+- **macOS 26 SDKs & APIs**: Always target and prefer the latest macOS 26 APIs. Use new framework additions over deprecated or legacy alternatives. Never reach for an older API when a modern replacement exists in the SDK. DO NOT USE ANYTHING THAT IS iOS ONLY.
 - **Swift & SwiftUI Maximalist**: Use Swift and SwiftUI for everything possible. Prefer SwiftUI views, layout, animation, navigation, and data flow over AppKit/UIKit equivalents. Only drop to AppKit/`NSViewRepresentable` when SwiftUI cannot accomplish the requirement. Use the latest Swift language features (macros, parameter packs, typed throws, `~Copyable`, etc.) where they improve clarity or correctness.
 - **Swift Concurrency**: Use `async`/`await`, `Actor`, `AsyncStream`, and structured concurrency throughout. Avoid GCD (`DispatchQueue`) unless bridging to a non-async boundary. No `DispatchQueue.main.async` where `@MainActor` suffices.
 - **SwiftData / SwiftUI Data Flow**: Prefer `@Observable` + `@Environment` for state sharing. Use SwiftData (`@Model`, `@Query`) for persistence over Core Data directly. Avoid `ObservableObject`/`@StateObject` when `@Observable` covers the need.
