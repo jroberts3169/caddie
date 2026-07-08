@@ -110,6 +110,283 @@ enum Geo {
         let lon3 = lon1 + atan2(by, cos(lat1) + bx)
         return CLLocationCoordinate2D(latitude: lat3 * 180 / .pi, longitude: lon3 * 180 / .pi)
     }
+
+    /// Destination coordinate reached by travelling `distance_m` metres from
+    /// `origin` along the initial compass `bearingDeg`. Used to probe a short
+    /// ground baseline for the shot-arc's live screen-space projection.
+    static func destination(from origin: CLLocationCoordinate2D,
+                            bearingDeg: Double,
+                            distance_m: Double) -> CLLocationCoordinate2D {
+        let radius = 6_371_000.0
+        let angular = distance_m / radius
+        let bearing = bearingDeg * .pi / 180
+        let lat1 = origin.latitude * .pi / 180
+        let lon1 = origin.longitude * .pi / 180
+        let lat2 = asin(sin(lat1) * cos(angular) + cos(lat1) * sin(angular) * cos(bearing))
+        let lon2 = lon1 + atan2(sin(bearing) * sin(angular) * cos(lat1),
+                                cos(angular) - sin(lat1) * sin(lat2))
+        return CLLocationCoordinate2D(latitude: lat2 * 180 / .pi, longitude: lon2 * 180 / .pi)
+    }
+}
+
+// MARK: - Shot arc overlay
+
+/// Transparent screen-space `NSView` layered over the `MKMapView` that renders
+/// each recorded shot as a red parabolic ball-flight arc rising off the ground,
+/// with a soft ground shadow beneath it. Because the map runs `.realistic`
+/// elevation, a sky-rising arc can't be an `MKOverlay` (overlays are glued to
+/// the terrain plane and inherit the 3D perspective). Instead the endpoints are
+/// re-projected to screen space every display-link tick via
+/// `map.convert(_:toPointTo:)`, and the apex is lifted by the world-up height
+/// projected through the current camera pitch. A cheap camera+data fingerprint
+/// skips ticks where nothing moved (per the repo's 60Hz-overlay memory rule).
+///
+/// The view is deliberately left in AppKit's default *unflipped* space
+/// (screen-up = +y), so raising the apex *adds* to the control point's `y`.
+fileprivate final class ShotArcOverlayView: NSView {
+    struct ArcSegment {
+        let from: CLLocationCoordinate2D
+        let to: CLLocationCoordinate2D
+    }
+
+    weak var mapView: MKMapView?
+
+    /// The shot segments to draw. Setting invalidates the fingerprint so the next
+    /// tick rebuilds even if the camera is settled.
+    var segments: [ArcSegment] = [] {
+        didSet { fingerprint = nil; tick() }
+    }
+
+    private static let shadowAlphaMin: CGFloat = 0.08
+    private static let shadowAlphaMax: CGFloat = 0.5
+
+    private var arcDisplayLink: CADisplayLink?
+    private var fingerprint: [Double]?
+
+    private let arcLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.strokeColor = NSColor.systemRed.withAlphaComponent(0.95).cgColor
+        l.fillColor = NSColor.clear.cgColor
+        l.lineWidth = 2.5
+        l.lineCap = .round
+        l.lineJoin = .round
+        l.shadowColor = NSColor.black.cgColor
+        l.shadowOpacity = 0.6
+        l.shadowRadius = 2
+        l.shadowOffset = .zero
+        return l
+    }()
+    /// Container for per-segment ground-shadow strokes, sorted beneath the arc.
+    private let shadowContainer = CALayer()
+    /// Recycled shadow stroke layers (grown/shrunk instead of reallocated each tick).
+    private var shadowSegments: [CAShapeLayer] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.addSublayer(shadowContainer)
+        layer?.addSublayer(arcLayer)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Fully transparent to clicks so MapKit pan/zoom and the map's gesture
+    /// recognizers keep working underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        arcDisplayLink?.invalidate()
+        arcDisplayLink = nil
+        guard window != nil else { return }
+        // A display link reliably follows MKMapView's internal animation ticks
+        // (inertial pan, pitch, zoom easing) even while the region stays settled
+        // between delegate callbacks, and is ProMotion-aware.
+        let link = displayLink(target: self, selector: #selector(tick))
+        link.add(to: .main, forMode: .common)
+        arcDisplayLink = link
+    }
+
+    override func layout() {
+        super.layout()
+        let scale = window?.backingScaleFactor ?? 2
+        arcLayer.frame = bounds
+        arcLayer.contentsScale = scale
+        shadowContainer.frame = bounds
+        for s in shadowSegments { s.contentsScale = scale }
+        fingerprint = nil
+        tick()
+    }
+
+    deinit { arcDisplayLink?.invalidate() }
+
+    @objc private func tick() {
+        guard let map = mapView else {
+            arcLayer.path = nil
+            clearShadow()
+            return
+        }
+        let cam = map.camera
+        let center = cam.centerCoordinate
+        let fp: [Double] = [
+            center.latitude, center.longitude, cam.heading, Double(cam.pitch),
+            cam.centerCoordinateDistance,
+            Double(bounds.width), Double(bounds.height),
+            Double(segments.count)
+        ]
+        if let existing = fingerprint, existing == fp { return }
+        fingerprint = fp
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        guard !segments.isEmpty else {
+            arcLayer.path = nil
+            clearShadow()
+            return
+        }
+
+        // Camera pitch is the only per-frame input the arc height needs, and it's a
+        // stable scalar straight off the camera (no terrain sampling). Everything
+        // else about a shot's height is derived per-segment from the on-screen
+        // distance between its two projected marker points — see `arcGeometry`.
+        let pitchScale = CGFloat(sin(Double(map.camera.pitch) * .pi / 180))
+
+        let combined = CGMutablePath()
+        var shadowSpecs: [(path: CGPath, alpha: CGFloat)] = []
+        for seg in segments {
+            guard let g = arcGeometry(for: seg, on: map, pitchScale: pitchScale) else { continue }
+            combined.addPath(g.arc)
+
+            // Ground shadow: connect consecutive projected ground samples (same
+            // points the arc rises from), dark at takeoff/landing and faint under
+            // the apex. Breaks the stroke across any behind-camera/off-screen sample
+            // exactly like the arc, so a prior shot's off-screen start never streaks.
+            let pts = g.groundSamples
+            guard pts.count == g.validity.count else { continue }
+            for i in 1..<pts.count {
+                guard g.validity[i - 1], g.validity[i] else { continue }
+                let uMid = (CGFloat(i) - 0.5) / CGFloat(pts.count - 1)
+                let bell = 1 - 4 * uMid * (1 - uMid)  // 1 at ends, 0 at apex
+                let alpha = Self.shadowAlphaMin + (Self.shadowAlphaMax - Self.shadowAlphaMin) * bell
+                let p = CGMutablePath()
+                p.move(to: pts[i - 1])
+                p.addLine(to: pts[i])
+                shadowSpecs.append((p, alpha))
+            }
+        }
+        arcLayer.path = combined
+        applyShadow(shadowSpecs)
+    }
+
+    private struct ArcGeom {
+        let arc: CGPath
+        /// Projected ground point of each sample (no altitude lift) — the shadow
+        /// rides these.
+        let groundSamples: [CGPoint]
+        /// Per-sample validity (finite + within the sanity rect), so the shadow can
+        /// break across the same behind-camera/off-screen points the arc does.
+        let validity: [Bool]
+    }
+
+    /// Number of world-space samples per arc. The parabola is walked in ground
+    /// parameter space and each sample is projected live, so the curve tracks the
+    /// terrain at every camera angle instead of relying on one screen-space
+    /// control point (which drifts/overshoots under perspective).
+    private static let arcSamples = 40
+
+    /// Fraction of a shot's on-screen chord length used as its apex height (before
+    /// the pitch scale). Larger = taller arcs. A single knob for the flight look.
+    private static let apexRatio: CGFloat = 0.22
+    /// Apex height clamp in screen points, so a very short chip still lifts a
+    /// little and a long drive doesn't balloon off the top of the screen.
+    private static let apexMinPx: CGFloat = 6
+    private static let apexMaxPx: CGFloat = 200
+
+    private func arcGeometry(for seg: ArcSegment, on map: MKMapView, pitchScale: CGFloat) -> ArcGeom? {
+        let startPt = map.convert(seg.from, toPointTo: self)
+        let endPt = map.convert(seg.to, toPointTo: self)
+        let chord = hypot(endPt.x - startPt.x, endPt.y - startPt.y)
+        guard chord > 0.5 else { return nil }
+        guard Geo.distance(seg.from, seg.to) > 0.1 else { return nil }
+
+        // Apex height is measured directly in SCREEN pixels: a fraction of the
+        // on-screen chord between the two projected marker points, scaled by the
+        // camera pitch (flat/top-down => no bulge) and clamped. Because it depends
+        // only on the two endpoint projections and a stable pitch scalar — never a
+        // per-frame terrain probe — the height glides smoothly as the camera moves
+        // instead of pulsing with the streaming `.realistic` elevation mesh. The
+        // chord naturally foreshortens with perspective and shrinks with zoom, so
+        // the arc stays proportionate at every camera angle.
+        let apexPx = min(max(chord * Self.apexRatio, Self.apexMinPx), Self.apexMaxPx) * pitchScale
+
+        // Walk the flight in ground-parameter space. Each sample's ground point is
+        // projected live through the camera so the curve rides the true ground path
+        // (and its terrain), then lifted straight up the screen by its parabolic
+        // height fraction × the screen-space apex. f=0 and f=1 lift by zero, so the
+        // arc's two ends sit EXACTLY on the projected marker coordinates — anchored
+        // to the tee/shot glyphs at every camera angle. Positive screen-Y is up
+        // (the view is unflipped).
+        //
+        // `map.convert(_:toPointTo:)` returns garbage for coordinates behind the
+        // camera or beyond the horizon (common when zoomed in close: a prior shot's
+        // start point sits behind the viewpoint), which projects to a wild screen
+        // point and streaks an errant line across the view. Guard each sample against
+        // a generous sanity rect and BREAK the stroke (move, don't line) across any
+        // invalid point so only the on-screen, valid portion of the arc is drawn.
+        let sanity = bounds.insetBy(dx: -bounds.width * 2, dy: -bounds.height * 2)
+        let arc = CGMutablePath()
+        var groundSamples: [CGPoint] = []
+        var validity: [Bool] = []
+        let n = Self.arcSamples
+        var penDown = false
+        for i in 0...n {
+            let f = CGFloat(i) / CGFloat(n)
+            let coord = CLLocationCoordinate2D(
+                latitude: seg.from.latitude + (seg.to.latitude - seg.from.latitude) * Double(f),
+                longitude: seg.from.longitude + (seg.to.longitude - seg.from.longitude) * Double(f))
+            let groundPt = map.convert(coord, toPointTo: self)
+            let lift = 4 * f * (1 - f) * apexPx  // parabola: 0 at ends, apex at f=0.5
+            let pt = CGPoint(x: groundPt.x, y: groundPt.y + lift)
+            let valid = pt.x.isFinite && pt.y.isFinite && groundPt.x.isFinite
+                && groundPt.y.isFinite && sanity.contains(pt)
+            groundSamples.append(groundPt)
+            validity.append(valid)
+            if valid {
+                if penDown { arc.addLine(to: pt) } else { arc.move(to: pt); penDown = true }
+            } else {
+                penDown = false
+            }
+        }
+        return ArcGeom(arc: arc, groundSamples: groundSamples, validity: validity)
+    }
+
+    private func applyShadow(_ specs: [(path: CGPath, alpha: CGFloat)]) {
+        let scale = window?.backingScaleFactor ?? 2
+        while shadowSegments.count < specs.count {
+            let l = CAShapeLayer()
+            l.fillColor = NSColor.clear.cgColor
+            l.strokeColor = NSColor.black.cgColor
+            l.lineWidth = 2
+            l.lineCap = .butt
+            l.contentsScale = scale
+            shadowContainer.addSublayer(l)
+            shadowSegments.append(l)
+        }
+        while shadowSegments.count > specs.count {
+            shadowSegments.removeLast().removeFromSuperlayer()
+        }
+        for (i, spec) in specs.enumerated() {
+            shadowSegments[i].path = spec.path
+            shadowSegments[i].opacity = Float(spec.alpha)
+        }
+    }
+
+    private func clearShadow() {
+        for l in shadowSegments { l.removeFromSuperlayer() }
+        shadowSegments.removeAll()
+    }
 }
 
 /// Flat, `Equatable` snapshot of the per-layer style (resolved `NSColor` + a
@@ -205,6 +482,16 @@ struct CourseMapView: NSViewRepresentable {
         container.addSubview(map)
         context.coordinator.map = map
 
+        // Screen-space overlay that draws each shot as a rising ball-flight arc +
+        // ground shadow. Added below the map's annotation views so the arc passes
+        // behind the tee/pin/shot glyphs; it's click-transparent so the map stays
+        // freely pannable.
+        let arc = ShotArcOverlayView(frame: map.bounds)
+        arc.autoresizingMask = [.width, .height]
+        arc.wantsLayer = true
+        map.addSubview(arc, positioned: .below, relativeTo: nil)
+        arc.mapView = map
+        context.coordinator.arcOverlay = arc
         // Click-to-record-a-shot (gated to Play mode in the handler). A plain click
         // recognizer fires reliably on a zero-movement click; MapKit's own pan still
         // owns drags, so the map stays freely pannable.
@@ -252,7 +539,6 @@ private enum OverlayRole: String {
     case boundary
     case feature
     case hole
-    case shot
 }
 
 /// `MKPolygon` that remembers which layer/role styles it. Subclassing lets the
@@ -377,6 +663,8 @@ extension CourseMapView {
         )
 
         weak var map: MKMapView?
+        /// Screen-space overlay that renders shot arcs + shadows.
+        fileprivate weak var arcOverlay: ShotArcOverlayView?
         /// Called with the clicked coordinate while in Play mode.
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
         /// Called with a tapped tee's hole OSM id while in Play mode.
@@ -443,6 +731,9 @@ extension CourseMapView {
         ) {
             currentHoleID = currentHole?.osmIdentifier
             let segments = shotSegments(shots: shots, currentHole: currentHole)
+            arcOverlay?.segments = segments.map {
+                ShotArcOverlayView.ArcSegment(from: $0.from, to: $0.to)
+            }
             syncMapConfiguration(map: map, style: style)
             syncOverlays(
                 map: map,
@@ -748,14 +1039,10 @@ extension CourseMapView {
                     map.addOverlay(poly, level: .aboveLabels)
                 }
             }
-            // Shot segments sit above labels so they are always visible over terrain.
-            for segment in segments {
-                var coords = [segment.from, segment.to]
-                let line = StyledPolyline(coordinates: &coords, count: coords.count)
-                line.layer = .unknown
-                line.role = .shot
-                map.addOverlay(line, level: .aboveLabels)
-            }
+            // Recorded shots are drawn as rising ball-flight arcs by
+            // `ShotArcOverlayView` (a screen-space overlay), not as ground
+            // polylines — a sky-rising arc can't be an MKOverlay glued to the
+            // 3D terrain plane.
             map.removeOverlays(old)
         }
 
@@ -808,10 +1095,7 @@ extension CourseMapView {
                 let renderer = MKPolylineRenderer(polyline: line)
                 let color = currentStyle?.color(line.layer) ?? .white
                 renderer.strokeColor = color
-                if line.role == .shot {
-                    renderer.strokeColor = NSColor.systemOrange.withAlphaComponent(0.85)
-                    renderer.lineWidth = 3
-                } else if line.role == .hole {
+                if line.role == .hole {
                     renderer.lineWidth = 2
                     renderer.lineDashPattern = [6, 4]
                     if let id = line.osmIdentifier {
