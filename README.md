@@ -13,7 +13,6 @@ the background.
 - [Caddie](#caddie)
   - [Table of Contents](#table-of-contents)
   - [Features](#features)
-  - [Screenshots](#screenshots)
   - [Requirements](#requirements)
   - [Getting Started](#getting-started)
     - [Debug logging](#debug-logging)
@@ -37,10 +36,6 @@ the background.
   API and cached locally for offline reuse.
 - **Customizable overlays** — an **Overlay Settings** window (⌘,) lets you recolor
   every map overlay layer and toggle each one's visibility.
-
-## Screenshots
-
-> _Add screenshots of the Course Sidebar and Map Detail Pane here._
 
 ## Requirements
 
