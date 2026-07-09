@@ -541,9 +541,11 @@ struct ContentView: View {
         return courseHoles[currentHoleIndex].osmIdentifier
     }
 
-    /// Shots recorded on the currently focused hole.
+    /// Shots recorded on the currently focused hole. Only surfaced in Play mode;
+    /// switching back to Plan hides them from the map without discarding them, so
+    /// returning to Play restores the same shots.
     private var currentHoleShots: [Shot] {
-        guard let id = currentHoleID else { return [] }
+        guard appMode == .play, let id = currentHoleID else { return [] }
         return shotsByHole[id] ?? []
     }
 
