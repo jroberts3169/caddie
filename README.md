@@ -1,5 +1,7 @@
 # Caddie
 
+[![CI](https://github.com/jroberts3169/caddie/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jroberts3169/caddie/actions/workflows/ci.yml)
+
 A native macOS app for finding golf courses and viewing them on a realistic 3D
 satellite map. Search for any course, star your favorites, and Caddie keeps
 track of the ones you've recently viewed — while fetching detailed course

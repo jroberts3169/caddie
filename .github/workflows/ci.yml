@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT: caddie.xcodeproj
+  SCHEME: caddie
+  XCODE_VER: 26.5
+
+jobs:
+  # Deterministic, network-free unit tests (yardage math, OSM ref parsing,
+  # LRU cache). This job is the one the README badge tracks — it must stay
+  # reliably green, so nothing here touches the network.
+  unit-tests:
+    name: Unit Tests (deterministic)
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_${{ env.XCODE_VER }}.app
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Resolve dependencies
+        run: |
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -resolvePackageDependencies
+
+      - name: Run unit tests
+        run: |
+          # Ad-hoc sign locally-run tests: no "Mac Development" cert exists on
+          # the runner. CODE_SIGNING_ALLOWED stays at its default (YES) so the
+          # ad-hoc signature is actually applied.
+          xcodebuild test \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination "platform=macOS" \
+            -only-testing:caddieTests \
+            -resultBundlePath build/UnitTestResults.xcresult \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: unit-test-results
+          path: build/UnitTestResults.xcresult
+          if-no-files-found: warn
+
+  # Network-dependent UI tests (drive MKLocalSearch + Overpass through the real
+  # UI). These are inherently flaky under CI network rate-limiting, so this job
+  # is advisory only: continue-on-error keeps a transient UI-test failure from
+  # turning the workflow — and the README badge — red.
+  ui-tests:
+    name: UI Tests (network, advisory)
+    runs-on: macos-26
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_${{ env.XCODE_VER }}.app
+
+      - name: Resolve dependencies
+        run: |
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -resolvePackageDependencies
+
+      - name: Run UI tests
+        run: |
+          # Retry once: these tests fail intermittently on network rate-limiting
+          # and keyboard-focus timing, not on real regressions.
+          run_ui() {
+            xcodebuild test \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -destination "platform=macOS" \
+              -only-testing:caddieUITests \
+              -resultBundlePath "build/UITestResults-$1.xcresult" \
+              CODE_SIGN_IDENTITY="-" \
+              CODE_SIGNING_REQUIRED=NO \
+              AD_HOC_CODE_SIGNING_ALLOWED=YES
+          }
+          run_ui 1 || run_ui 2
+
+      - name: Upload UI test results
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ui-test-results
+          path: build/UITestResults-*.xcresult
+          if-no-files-found: warn
