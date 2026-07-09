@@ -199,6 +199,12 @@ struct ContentView: View {
     @Query(sort: \FavoriteCourse.name, order: .forward) private var favorites: [FavoriteCourse]
     @State private var searchText: String = ""
     @State private var searchResults: [GolfCourse] = []
+    /// Whether a course text search is currently in flight, so the Results section
+    /// can show progress instead of a dead-looking empty list while MapKit works.
+    @State private var isSearching: Bool = false
+    /// The most recent search task, cancelled on each keystroke so a slow earlier
+    /// query can't overwrite the results (or clear the progress) of a newer one.
+    @State private var searchTask: Task<Void, Never>?
     @State private var selection: SidebarSelection?
     @State private var displayedCourse: GolfCourse?
     @State private var courseOutlines: [[CLLocationCoordinate2D]] = []
@@ -290,12 +296,16 @@ struct ContentView: View {
         .background(FullScreenToolbarAutoHide())
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
         .onChange(of: searchText) { _, newValue in
-            if newValue.isEmpty {
+            searchTask?.cancel()
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
                 searchResults = []
-            } else {
-                Task {
-                    await performSearch(query: newValue)
-                }
+                isSearching = false
+                return
+            }
+            isSearching = true
+            searchTask = Task {
+                await performSearch(query: trimmed)
             }
         }
         .onChange(of: selection) { _, newValue in
@@ -1204,12 +1214,18 @@ struct ContentView: View {
         request.pointOfInterestFilter = MKPointOfInterestFilter(including: [.golf])
 
         let search = MKLocalSearch(request: request)
-        guard let response = try? await search.start() else { return }
+        let response = try? await search.start()
 
-        let results = response.mapItems.map(golfCourse(from:))
+        // A newer keystroke cancelled this search; drop its now-stale outcome so it
+        // can't overwrite the fresher query's results or clear its progress spinner.
+        if Task.isCancelled { return }
+
+        let results = response?.mapItems.map(golfCourse(from:)) ?? []
 
         await MainActor.run {
+            guard !Task.isCancelled else { return }
             searchResults = results
+            isSearching = false
         }
     }
 
@@ -1358,16 +1374,51 @@ struct ContentView: View {
                     }
                 }
             }
-            if !searchResults.isEmpty {
+            if !trimmedSearchText.isEmpty {
                 Section("Results") {
-                    ForEach(searchResults) { course in
-                        courseRow(course: course, subtitle: locationSubtitle(for: course), kind: "result")
-                            .tag(SidebarSelection.result(course))
-                        subCourseRows(for: course)
+                    if searchResults.isEmpty {
+                        if isSearching {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Searching…")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .accessibilityIdentifier("searchProgressRow")
+                        } else {
+                            Text("No courses found")
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("searchNoResultsRow")
+                        }
+                    } else {
+                        ForEach(searchResults) { course in
+                            courseRow(course: course, subtitle: locationSubtitle(for: course), kind: "result")
+                                .tag(SidebarSelection.result(course))
+                            subCourseRows(for: course)
+                        }
                     }
                 }
             }
         }
+        .overlay {
+            // Pristine sidebar — nothing saved and no active search — so point the
+            // user at the search field instead of showing a blank pane.
+            if favorites.isEmpty, recents.isEmpty, trimmedSearchText.isEmpty {
+                ContentUnavailableView {
+                    Label("Find a Course", systemImage: "magnifyingglass")
+                } description: {
+                    Text("Search for a golf course to get started.")
+                }
+                .accessibilityIdentifier("sidebarEmptyState")
+            }
+        }
+    }
+
+    /// `searchText` with surrounding whitespace stripped. The sidebar keys its
+    /// Results section and the "get started" empty state off this so a stray space
+    /// isn't treated as an active search.
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// "City, State" for the Results subtitle, gracefully omitting whichever part
