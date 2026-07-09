@@ -14,7 +14,7 @@ concurrency:
 env:
   PROJECT: caddie.xcodeproj
   SCHEME: caddie
-  XCODE_VER: 26.5
+  XCODE_VER: 26
 
 jobs:
   # Deterministic, network-free unit tests (yardage math, OSM ref parsing,
