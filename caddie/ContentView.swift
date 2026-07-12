@@ -560,9 +560,66 @@ struct ContentView: View {
     }
 
     /// Appends a shot at `coordinate` to the currently focused hole.
+    ///
+    /// The tapped point is the landing; the shot is struck from the tee (first
+    /// shot) or the previous shot's landing. A `ShotGenerator` back-fits a
+    /// physics-consistent `TrackmanShot` for that start→land pair, aimed down the
+    /// remaining line to the pin. The RNG is seeded from the hole id + shot index
+    /// so a shot's arc shape stays stable across the map's 60 Hz redraws instead
+    /// of reshaping every frame. The generated shot is also persisted as a
+    /// `ShotRecord` in SwiftData.
     private func addShotToCurrentHole(_ coordinate: CLLocationCoordinate2D) {
-        guard let id = currentHoleID else { return }
-        shotsByHole[id, default: []].append(Shot(coordinate: coordinate))
+        guard let id = currentHoleID,
+              courseHoles.indices.contains(currentHoleIndex) else { return }
+        let hole = courseHoles[currentHoleIndex]
+
+        let existing = shotsByHole[id] ?? []
+        let shotIndex = existing.count            // 0-based index of the shot being added
+        // Struck from the tee for the first shot, otherwise the previous landing.
+        let start = existing.last?.land
+            ?? hole.coordinates.first.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+            ?? coordinate
+        // Aim straight at the tapped landing spot (not the pin) so the shot flies
+        // straight to where the user clicked. Aiming at the pin makes the generator
+        // treat any landing off the start→pin line as a cross-track side offset and
+        // bow every shot toward the pin — matching golf-gen, aim at the landing.
+        let aimBearing = Geo.initialBearing(start, coordinate)
+
+        // A shot struck from on the green is a putt. Passing `startsOnGreen`
+        // selects the putter, whose generated `MaxHeight` is ~0.05 m, so the
+        // flight arc renders naturally flat (no bow) — this is how golf-gen
+        // suppresses putt arcs: not by filtering, but via a flat trajectory.
+        let startPt = Coordinate(lat: start.latitude, lon: start.longitude)
+        let startsOnGreen = courseFeatures.contains {
+            $0.kind == .green && GolfGeometry.isInside(startPt, polygon: $0.coordinates)
+        }
+
+        // Deterministic per-shot seed: stable across redraws, distinct per shot.
+        let seed = UInt64(bitPattern: Int64(id &+ Int64(shotIndex &+ 1)))
+        var generator = ShotGenerator(seed: seed)
+        let output = generator.generate(ShotGenerator.Input(
+            start: start,
+            aimBearing: aimBearing,
+            landing: coordinate,
+            clubHint: nil,
+            startsOnGreen: startsOnGreen
+        ))
+
+        let shot = Shot(start: start, land: coordinate, club: output.club, trackman: output.shot)
+        shotsByHole[id, default: []].append(shot)
+
+        // Persist the generated measurement.
+        let record = ShotRecord(
+            holeID: id,
+            courseIdentifier: displayedCourse?.identifier ?? "",
+            shotIndex: shotIndex + 1,
+            club: output.club,
+            start: GeoPoint(start),
+            land: GeoPoint(coordinate),
+            surface: startsOnGreen ? .green : .fairway,
+            trackman: output.shot
+        )
+        modelContext.insert(record)
     }
 
     /// Removes every shot on the currently focused hole.
@@ -1526,7 +1583,7 @@ extension EnvironmentValues {
 
 #Preview {
     ContentView()
-        .modelContainer(for: [RecentCourse.self, FavoriteCourse.self, OSMCourseData.self], inMemory: true)
+        .modelContainer(for: [RecentCourse.self, FavoriteCourse.self, OSMCourseData.self, ShotRecord.self], inMemory: true)
         .environment(OverlaySettings())
 }
 
