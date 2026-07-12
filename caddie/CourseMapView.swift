@@ -147,6 +147,19 @@ fileprivate final class ShotArcOverlayView: NSView {
     struct ArcSegment {
         let from: CLLocationCoordinate2D
         let to: CLLocationCoordinate2D
+        /// Terrain heights (metres above sea level) sampled at evenly spaced
+        /// fractions from `from` (index 0) to `to` (last index) along the ground
+        /// path, so the arc can ride the hillside instead of a flat plane. Empty
+        /// until the async elevation lookup resolves; an empty profile renders the
+        /// original flat arc, so there's no regression before data arrives or
+        /// when offline.
+        var elevations: [Double] = []
+        /// Reference height (metres above sea level) that terrain lift is measured
+        /// from — shared across every segment of a hole (the hole's tee) so
+        /// consecutive shot arcs join continuously at each shared marker instead of
+        /// kinking. A point at `baselineElevation` sits exactly on the flat plane;
+        /// higher ground lifts the arc up-screen, lower ground drops it.
+        var baselineElevation: Double = 0
     }
 
     weak var mapView: MKMapView?
@@ -321,13 +334,31 @@ fileprivate final class ShotArcOverlayView: NSView {
         // the arc stays proportionate at every camera angle.
         let apexPx = min(max(chord * Self.apexRatio, Self.apexMinPx), Self.apexMaxPx) * pitchScale
 
+        // Terrain lift: convert a metre of world-up (elevation) into screen pixels.
+        // A MapKit camera has zero roll, so world-up always projects to screen-Y;
+        // the scale is `sin(pitch) × unforeshortened_ground_ppm`, where the ppm is
+        // sampled along the axis parallel to the image plane (camera heading + 90°)
+        // so it foreshortens only with zoom — not pitch or yaw. At pitch 0 this
+        // collapses to 0, which is correct: elevation is invisible top-down.
+        let hasTerrain = seg.elevations.count > 1
+        let baselineElev = seg.baselineElevation
+        let altitudePxPerM: CGFloat = {
+            guard hasTerrain, pitchScale > 0 else { return 0 }
+            let mid = Geo.midpoint(seg.from, seg.to)
+            let perpBearing = (Double(map.camera.heading) + 90).truncatingRemainder(dividingBy: 360)
+            let vp = groundUnitProjection(from: mid, bearingDeg: perpBearing, map: map)
+            return hypot(vp.x, vp.y) * pitchScale
+        }()
+
         // Walk the flight in ground-parameter space. Each sample's ground point is
-        // projected live through the camera so the curve rides the true ground path
-        // (and its terrain), then lifted straight up the screen by its parabolic
-        // height fraction × the screen-space apex. f=0 and f=1 lift by zero, so the
-        // arc's two ends sit EXACTLY on the projected marker coordinates — anchored
-        // to the tee/shot glyphs at every camera angle. Positive screen-Y is up
-        // (the view is unflipped).
+        // projected live through the camera so the curve rides the true ground path,
+        // then raised up the screen by (a) the terrain height at that point relative
+        // to the takeoff, so the arc sits on the real hillside and a downhill/uphill
+        // shot visibly descends/climbs, and (b) its parabolic flight-bow fraction ×
+        // the screen-space apex. f=0 lifts by zero terrain + zero bow, so the arc's
+        // start stays EXACTLY on the takeoff marker; the landing end rises or drops
+        // by the real elevation change. Positive screen-Y is up (the view is
+        // unflipped).
         //
         // `map.convert(_:toPointTo:)` returns garbage for coordinates behind the
         // camera or beyond the horizon (common when zoomed in close: a prior shot's
@@ -347,11 +378,19 @@ fileprivate final class ShotArcOverlayView: NSView {
                 latitude: seg.from.latitude + (seg.to.latitude - seg.from.latitude) * Double(f),
                 longitude: seg.from.longitude + (seg.to.longitude - seg.from.longitude) * Double(f))
             let groundPt = map.convert(coord, toPointTo: self)
-            let lift = 4 * f * (1 - f) * apexPx  // parabola: 0 at ends, apex at f=0.5
-            let pt = CGPoint(x: groundPt.x, y: groundPt.y + lift)
-            let valid = pt.x.isFinite && pt.y.isFinite && groundPt.x.isFinite
-                && groundPt.y.isFinite && sanity.contains(pt)
-            groundSamples.append(groundPt)
+            // Terrain height at this sample, relative to the shared baseline, in
+            // screen pixels. The shadow rides this ground path; the arc adds the
+            // flight bow on top.
+            let terrainLift = hasTerrain
+                ? CGFloat(sampledElevation(seg.elevations, at: f) - baselineElev) * altitudePxPerM
+                : 0
+            let groundY = groundPt.y + terrainLift
+            let flightLift = 4 * f * (1 - f) * apexPx  // parabola: 0 at ends, apex at f=0.5
+            let pt = CGPoint(x: groundPt.x, y: groundY + flightLift)
+            let groundSample = CGPoint(x: groundPt.x, y: groundY)
+            let valid = pt.x.isFinite && pt.y.isFinite && groundSample.x.isFinite
+                && groundSample.y.isFinite && sanity.contains(pt)
+            groundSamples.append(groundSample)
             validity.append(valid)
             if valid {
                 if penDown { arc.addLine(to: pt) } else { arc.move(to: pt); penDown = true }
@@ -360,6 +399,33 @@ fileprivate final class ShotArcOverlayView: NSView {
             }
         }
         return ArcGeom(arc: arc, groundSamples: groundSamples, validity: validity)
+    }
+
+    /// Linear-interpolates an evenly spaced elevation profile (index 0 = takeoff,
+    /// last index = landing) at flight fraction `f`. Values are metres above sea
+    /// level; the caller subtracts the takeoff height to get a relative lift.
+    private func sampledElevation(_ profile: [Double], at f: CGFloat) -> Double {
+        guard profile.count > 1 else { return profile.first ?? 0 }
+        let x = max(0, min(1, f)) * CGFloat(profile.count - 1)
+        let i = Int(x)
+        if i >= profile.count - 1 { return profile[profile.count - 1] }
+        let t = Double(x - CGFloat(i))
+        return profile[i] * (1 - t) + profile[i + 1] * t
+    }
+
+    /// Screen-space vector that one metre of ground travel along `bearingDeg` at
+    /// `origin` projects to under the current camera. Probes a 10 m baseline
+    /// centred on `origin` and divides by 10 so the result is robust to
+    /// map-projection non-linearity over short distances.
+    private func groundUnitProjection(from origin: CLLocationCoordinate2D,
+                                      bearingDeg: Double,
+                                      map: MKMapView) -> CGPoint {
+        let half = 5.0
+        let a = Geo.destination(from: origin, bearingDeg: bearingDeg, distance_m: half)
+        let b = Geo.destination(from: origin, bearingDeg: bearingDeg + 180, distance_m: half)
+        let pa = map.convert(a, toPointTo: self)
+        let pb = map.convert(b, toPointTo: self)
+        return CGPoint(x: (pa.x - pb.x) / (2 * half), y: (pa.y - pb.y) / (2 * half))
     }
 
     private func applyShadow(_ specs: [(path: CGPath, alpha: CGFloat)]) {
@@ -665,6 +731,13 @@ extension CourseMapView {
         weak var map: MKMapView?
         /// Screen-space overlay that renders shot arcs + shadows.
         fileprivate weak var arcOverlay: ShotArcOverlayView?
+        /// Geometry fingerprint (all segment endpoint coords) of the arcs last
+        /// pushed to `arcOverlay`, so a purely cosmetic sync (hover, style) doesn't
+        /// wipe resolved elevations and re-trigger a lookup.
+        private var arcSegmentSignature: [Double] = []
+        /// Identifies the most recent async elevation lookup; a returning task whose
+        /// token no longer matches has been superseded and drops its result.
+        private var arcElevationToken = UUID()
         /// Called with the clicked coordinate while in Play mode.
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
         /// Called with a tapped tee's hole OSM id while in Play mode.
@@ -731,9 +804,7 @@ extension CourseMapView {
         ) {
             currentHoleID = currentHole?.osmIdentifier
             let segments = shotSegments(shots: shots, currentHole: currentHole)
-            arcOverlay?.segments = segments.map {
-                ShotArcOverlayView.ArcSegment(from: $0.from, to: $0.to)
-            }
+            updateArcSegments(segments)
             syncMapConfiguration(map: map, style: style)
             syncOverlays(
                 map: map,
@@ -1582,6 +1653,82 @@ extension CourseMapView {
             let to: CLLocationCoordinate2D
             let midpoint: CLLocationCoordinate2D
             let meters: Double
+        }
+
+        /// Number of terrain-height samples fetched along each shot segment (index
+        /// 0 = takeoff, last = landing). The ~90 m DEM is coarse relative to a golf
+        /// shot, so a handful of points, linearly interpolated in the arc, captures
+        /// the ground profile without over-fetching.
+        private static let arcElevationSamples = 9
+
+        /// Rebuilds the arc segments for the overlay when the shot geometry changes,
+        /// and kicks off an async terrain-elevation lookup so the arcs can ride the
+        /// hillside. Gated on a geometry fingerprint so cosmetic syncs (hover, style,
+        /// framing) neither wipe already-resolved elevations nor re-hit the network.
+        private func updateArcSegments(_ shotSegs: [ShotSegment]) {
+            let base = shotSegs.map {
+                ShotArcOverlayView.ArcSegment(from: $0.from, to: $0.to)
+            }
+            var signature: [Double] = []
+            signature.reserveCapacity(base.count * 4)
+            for s in base {
+                signature.append(contentsOf: [
+                    s.from.latitude, s.from.longitude, s.to.latitude, s.to.longitude,
+                ])
+            }
+            guard signature != arcSegmentSignature else { return }
+            arcSegmentSignature = signature
+
+            // Render flat immediately (matches the pre-terrain look) so there's no
+            // gap while elevations load; the async result upgrades the arcs in place.
+            arcOverlay?.segments = base
+            loadArcElevations(for: base)
+        }
+
+        /// Fetches terrain heights along each segment and, once resolved, pushes the
+        /// segments back to the overlay with their elevation profiles so the arcs
+        /// track the ground. A stale result (superseded by a newer geometry) is
+        /// dropped via the token. If any segment's lookup fails the whole hole
+        /// renders flat, so a partial profile can never introduce a discontinuity
+        /// between arcs.
+        private func loadArcElevations(for segments: [ShotArcOverlayView.ArcSegment]) {
+            guard !segments.isEmpty else { return }
+            let token = UUID()
+            arcElevationToken = token
+
+            let sampleCount = Self.arcElevationSamples
+            var perSegment: [[CLLocationCoordinate2D]] = []
+            var flat: [CLLocationCoordinate2D] = []
+            for seg in segments {
+                var coords: [CLLocationCoordinate2D] = []
+                for i in 0..<sampleCount {
+                    let f = Double(i) / Double(sampleCount - 1)
+                    coords.append(CLLocationCoordinate2D(
+                        latitude: seg.from.latitude + (seg.to.latitude - seg.from.latitude) * f,
+                        longitude: seg.from.longitude + (seg.to.longitude - seg.from.longitude) * f))
+                }
+                perSegment.append(coords)
+                flat.append(contentsOf: coords)
+            }
+
+            Task { @MainActor in
+                let heights = await ElevationProvider.shared.elevations(for: flat)
+                guard self.arcElevationToken == token else { return }
+                // All-or-nothing: every sample of every segment must resolve, or the
+                // hole stays flat. Guarantees a single continuous terrain profile.
+                let resolved = heights.compactMap { $0 }
+                guard resolved.count == heights.count, let baseline = resolved.first else { return }
+                var idx = 0
+                var updated: [ShotArcOverlayView.ArcSegment] = []
+                for (seg, coords) in zip(segments, perSegment) {
+                    var next = seg
+                    next.elevations = resolved[idx..<idx + coords.count].map { $0 }
+                    next.baselineElevation = baseline
+                    idx += coords.count
+                    updated.append(next)
+                }
+                self.arcOverlay?.segments = updated
+            }
         }
 
         /// Creates one segment per recorded shot. Shot 1 starts at the hole tee
