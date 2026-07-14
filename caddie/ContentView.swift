@@ -199,6 +199,12 @@ struct ContentView: View {
     @Query(sort: \FavoriteCourse.name, order: .forward) private var favorites: [FavoriteCourse]
     @State private var searchText: String = ""
     @State private var searchResults: [GolfCourse] = []
+    /// Whether a course text search is currently in flight, so the Results section
+    /// can show progress instead of a dead-looking empty list while MapKit works.
+    @State private var isSearching: Bool = false
+    /// The most recent search task, cancelled on each keystroke so a slow earlier
+    /// query can't overwrite the results (or clear the progress) of a newer one.
+    @State private var searchTask: Task<Void, Never>?
     @State private var selection: SidebarSelection?
     @State private var displayedCourse: GolfCourse?
     @State private var courseOutlines: [[CLLocationCoordinate2D]] = []
@@ -290,12 +296,16 @@ struct ContentView: View {
         .background(FullScreenToolbarAutoHide())
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search for a course")
         .onChange(of: searchText) { _, newValue in
-            if newValue.isEmpty {
+            searchTask?.cancel()
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
                 searchResults = []
-            } else {
-                Task {
-                    await performSearch(query: newValue)
-                }
+                isSearching = false
+                return
+            }
+            isSearching = true
+            searchTask = Task {
+                await performSearch(query: trimmed)
             }
         }
         .onChange(of: selection) { _, newValue in
@@ -550,9 +560,66 @@ struct ContentView: View {
     }
 
     /// Appends a shot at `coordinate` to the currently focused hole.
+    ///
+    /// The tapped point is the landing; the shot is struck from the tee (first
+    /// shot) or the previous shot's landing. A `ShotGenerator` back-fits a
+    /// physics-consistent `TrackmanShot` for that start→land pair, aimed down the
+    /// remaining line to the pin. The RNG is seeded from the hole id + shot index
+    /// so a shot's arc shape stays stable across the map's 60 Hz redraws instead
+    /// of reshaping every frame. The generated shot is also persisted as a
+    /// `ShotRecord` in SwiftData.
     private func addShotToCurrentHole(_ coordinate: CLLocationCoordinate2D) {
-        guard let id = currentHoleID else { return }
-        shotsByHole[id, default: []].append(Shot(coordinate: coordinate))
+        guard let id = currentHoleID,
+              courseHoles.indices.contains(currentHoleIndex) else { return }
+        let hole = courseHoles[currentHoleIndex]
+
+        let existing = shotsByHole[id] ?? []
+        let shotIndex = existing.count            // 0-based index of the shot being added
+        // Struck from the tee for the first shot, otherwise the previous landing.
+        let start = existing.last?.land
+            ?? hole.coordinates.first.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+            ?? coordinate
+        // Aim straight at the tapped landing spot (not the pin) so the shot flies
+        // straight to where the user clicked. Aiming at the pin makes the generator
+        // treat any landing off the start→pin line as a cross-track side offset and
+        // bow every shot toward the pin — matching golf-gen, aim at the landing.
+        let aimBearing = Geo.initialBearing(start, coordinate)
+
+        // A shot struck from on the green is a putt. Passing `startsOnGreen`
+        // selects the putter, whose generated `MaxHeight` is ~0.05 m, so the
+        // flight arc renders naturally flat (no bow) — this is how golf-gen
+        // suppresses putt arcs: not by filtering, but via a flat trajectory.
+        let startPt = Coordinate(lat: start.latitude, lon: start.longitude)
+        let startsOnGreen = courseFeatures.contains {
+            $0.kind == .green && GolfGeometry.isInside(startPt, polygon: $0.coordinates)
+        }
+
+        // Deterministic per-shot seed: stable across redraws, distinct per shot.
+        let seed = UInt64(bitPattern: Int64(id &+ Int64(shotIndex &+ 1)))
+        var generator = ShotGenerator(seed: seed)
+        let output = generator.generate(ShotGenerator.Input(
+            start: start,
+            aimBearing: aimBearing,
+            landing: coordinate,
+            clubHint: nil,
+            startsOnGreen: startsOnGreen
+        ))
+
+        let shot = Shot(start: start, land: coordinate, club: output.club, trackman: output.shot)
+        shotsByHole[id, default: []].append(shot)
+
+        // Persist the generated measurement.
+        let record = ShotRecord(
+            holeID: id,
+            courseIdentifier: displayedCourse?.identifier ?? "",
+            shotIndex: shotIndex + 1,
+            club: output.club,
+            start: GeoPoint(start),
+            land: GeoPoint(coordinate),
+            surface: startsOnGreen ? .green : .fairway,
+            trackman: output.shot
+        )
+        modelContext.insert(record)
     }
 
     /// Removes every shot on the currently focused hole.
@@ -1204,12 +1271,18 @@ struct ContentView: View {
         request.pointOfInterestFilter = MKPointOfInterestFilter(including: [.golf])
 
         let search = MKLocalSearch(request: request)
-        guard let response = try? await search.start() else { return }
+        let response = try? await search.start()
 
-        let results = response.mapItems.map(golfCourse(from:))
+        // A newer keystroke cancelled this search; drop its now-stale outcome so it
+        // can't overwrite the fresher query's results or clear its progress spinner.
+        if Task.isCancelled { return }
+
+        let results = response?.mapItems.map(golfCourse(from:)) ?? []
 
         await MainActor.run {
+            guard !Task.isCancelled else { return }
             searchResults = results
+            isSearching = false
         }
     }
 
@@ -1358,16 +1431,51 @@ struct ContentView: View {
                     }
                 }
             }
-            if !searchResults.isEmpty {
+            if !trimmedSearchText.isEmpty {
                 Section("Results") {
-                    ForEach(searchResults) { course in
-                        courseRow(course: course, subtitle: locationSubtitle(for: course), kind: "result")
-                            .tag(SidebarSelection.result(course))
-                        subCourseRows(for: course)
+                    if searchResults.isEmpty {
+                        if isSearching {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Searching…")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .accessibilityIdentifier("searchProgressRow")
+                        } else {
+                            Text("No courses found")
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("searchNoResultsRow")
+                        }
+                    } else {
+                        ForEach(searchResults) { course in
+                            courseRow(course: course, subtitle: locationSubtitle(for: course), kind: "result")
+                                .tag(SidebarSelection.result(course))
+                            subCourseRows(for: course)
+                        }
                     }
                 }
             }
         }
+        .overlay {
+            // Pristine sidebar — nothing saved and no active search — so point the
+            // user at the search field instead of showing a blank pane.
+            if favorites.isEmpty, recents.isEmpty, trimmedSearchText.isEmpty {
+                ContentUnavailableView {
+                    Label("Find a Course", systemImage: "magnifyingglass")
+                } description: {
+                    Text("Search for a golf course to get started.")
+                }
+                .accessibilityIdentifier("sidebarEmptyState")
+            }
+        }
+    }
+
+    /// `searchText` with surrounding whitespace stripped. The sidebar keys its
+    /// Results section and the "get started" empty state off this so a stray space
+    /// isn't treated as an active search.
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// "City, State" for the Results subtitle, gracefully omitting whichever part
@@ -1475,7 +1583,7 @@ extension EnvironmentValues {
 
 #Preview {
     ContentView()
-        .modelContainer(for: [RecentCourse.self, FavoriteCourse.self, OSMCourseData.self], inMemory: true)
+        .modelContainer(for: [RecentCourse.self, FavoriteCourse.self, OSMCourseData.self, ShotRecord.self], inMemory: true)
         .environment(OverlaySettings())
 }
 

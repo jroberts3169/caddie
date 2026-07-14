@@ -14,7 +14,7 @@ struct caddieApp: App {
 
     let modelContainer: ModelContainer = {
         do {
-            return try ModelContainer(for: RecentCourse.self, FavoriteCourse.self, OSMCourseData.self)
+            return try ModelContainer(for: RecentCourse.self, FavoriteCourse.self, OSMCourseData.self, ShotRecord.self)
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")
         }

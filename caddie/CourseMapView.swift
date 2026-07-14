@@ -17,21 +17,62 @@ import SwiftUI
 
 // MARK: - Inputs
 
-/// A single recorded shot on a hole: just a map coordinate plus a stable id so
-/// SwiftUI lists and the map annotation set can diff it.
+/// A single recorded shot on a hole. Carries the physics-backed `TrackmanShot`
+/// measurement plus the club and the start/land coordinates, so the on-map arc
+/// can bow to the shot's real apex (`MaxHeight`) and lateral shape (`Curve`).
+///
+/// `coordinate` (the landing point) and `init(coordinate:)` are kept as thin
+/// shims so the yardage/label/annotation code that only needs a point — and the
+/// tests — compile unchanged. The convenience initializer stamps a zeroed
+/// measurement (flat arc) for those non-physics call sites.
 struct Shot: Identifiable, Equatable {
     let id: UUID
-    var coordinate: CLLocationCoordinate2D
+    /// Where the shot was struck from (tee, or the previous shot's landing).
+    var start: CLLocationCoordinate2D
+    /// Where the shot came to rest — the point the marker is pinned to.
+    var land: CLLocationCoordinate2D
+    var club: Club
+    var trackman: TrackmanShot
 
+    /// Landing coordinate. Named `coordinate` so existing map/label code that
+    /// only needs the resting point keeps working.
+    var coordinate: CLLocationCoordinate2D { land }
+
+    /// Apex height in metres, straight off the generated measurement.
+    var apexHeight_m: Double { trackman.MaxHeight }
+    /// Lateral shape in metres (draw/fade), straight off the measurement.
+    var sideCurve_m: Double { trackman.Curve }
+
+    init(id: UUID = UUID(),
+         start: CLLocationCoordinate2D,
+         land: CLLocationCoordinate2D,
+         club: Club,
+         trackman: TrackmanShot) {
+        self.id = id
+        self.start = start
+        self.land = land
+        self.club = club
+        self.trackman = trackman
+    }
+
+    /// Lightweight initializer for call sites (tests, previews) that only have a
+    /// landing point and no physics. Produces a flat, zero-apex shot whose start
+    /// equals its landing.
     init(id: UUID = UUID(), coordinate: CLLocationCoordinate2D) {
         self.id = id
-        self.coordinate = coordinate
+        self.start = coordinate
+        self.land = coordinate
+        self.club = .iron7
+        self.trackman = .zero
     }
 
     static func == (lhs: Shot, rhs: Shot) -> Bool {
         lhs.id == rhs.id
-            && lhs.coordinate.latitude == rhs.coordinate.latitude
-            && lhs.coordinate.longitude == rhs.coordinate.longitude
+            && lhs.land.latitude == rhs.land.latitude
+            && lhs.land.longitude == rhs.land.longitude
+            && lhs.start.latitude == rhs.start.latitude
+            && lhs.start.longitude == rhs.start.longitude
+            && lhs.trackman == rhs.trackman
     }
 }
 
@@ -81,12 +122,38 @@ struct MapFramingRequest: Equatable {
     }
 }
 
-/// Small spherical-geometry helpers for framing a hole down its tee→pin axis.
+/// Small spherical-geometry helpers for framing a hole down its tee→pin axis
+/// and for the physics-backed shot generator (cross-track / bearing math).
 enum Geo {
+    /// Mean earth radius in metres, matching the shot generator's model.
+    static let earthRadius_m: Double = 6_371_008.8
+
+    static func toRadians(_ d: Double) -> Double { d * .pi / 180.0 }
+    static func toDegrees(_ r: Double) -> Double { r * 180.0 / .pi }
+
     /// Great-circle distance in metres.
     static func distance(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> CLLocationDistance {
         CLLocation(latitude: a.latitude, longitude: a.longitude)
             .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude))
+    }
+
+    /// Initial bearing (0…360, degrees, 0 = north) from `a` to `b`. Spelled
+    /// `initialBearing` to match the shot generator (`bearing(from:to:)` is the
+    /// framing code's spelling of the same value).
+    static func initialBearing(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Double {
+        bearing(from: a, to: b)
+    }
+
+    /// Signed cross-track distance in metres of `point` from the great-circle
+    /// aim line (`origin` → `bearingDeg`). Positive = right of the aim line (as a
+    /// RH player sees it), negative = left.
+    static func crossTrackDistance(point p: CLLocationCoordinate2D,
+                                   origin: CLLocationCoordinate2D,
+                                   bearingDeg: Double) -> Double {
+        let d13 = distance(origin, p) / earthRadius_m
+        let θ13 = toRadians(initialBearing(origin, p))
+        let θ12 = toRadians(bearingDeg)
+        return asin(sin(d13) * sin(θ13 - θ12)) * earthRadius_m
     }
 
     /// Initial bearing (compass degrees, 0 = north) from `a` to `b`.
@@ -135,11 +202,16 @@ enum Geo {
 /// each recorded shot as a red parabolic ball-flight arc rising off the ground,
 /// with a soft ground shadow beneath it. Because the map runs `.realistic`
 /// elevation, a sky-rising arc can't be an `MKOverlay` (overlays are glued to
-/// the terrain plane and inherit the 3D perspective). Instead the endpoints are
-/// re-projected to screen space every display-link tick via
-/// `map.convert(_:toPointTo:)`, and the apex is lifted by the world-up height
-/// projected through the current camera pitch. A cheap camera+data fingerprint
-/// skips ticks where nothing moved (per the repo's 60Hz-overlay memory rule).
+/// the terrain plane and inherit the 3D perspective).
+///
+/// The arc is a **2D quadratic Bézier drawn in screen space**, rebuilt every
+/// display-link tick from the live camera per `docs/shot-arc-rendering.md`:
+/// both endpoints are re-projected each frame (snapped to the rendered marker
+/// glyph centre so the arc foot is welded to the shot counter), and the control
+/// point is `chordMid + 2·(altitude·H + side·S)` where `H` is the shot's real
+/// apex height in metres and `S` its lateral curve in metres, each scaled to
+/// screen by a live camera-derived basis vector. The visible apex therefore
+/// lands exactly at `chordMid + offset`.
 ///
 /// The view is deliberately left in AppKit's default *unflipped* space
 /// (screen-up = +y), so raising the apex *adds* to the control point's `y`.
@@ -147,21 +219,35 @@ fileprivate final class ShotArcOverlayView: NSView {
     struct ArcSegment {
         let from: CLLocationCoordinate2D
         let to: CLLocationCoordinate2D
+        /// Apex height of the flight in metres (the shot's `TrackmanShot.MaxHeight`).
+        let apexHeight_m: Double
+        /// Lateral shape of the flight in metres (the shot's `TrackmanShot.Curve`),
+        /// signed: positive bows right of the aim line, negative left.
+        let sideCurve_m: Double
     }
 
     weak var mapView: MKMapView?
 
-    /// The shot segments to draw. Setting invalidates the fingerprint so the next
-    /// tick rebuilds even if the camera is settled.
+    /// The shot segments to draw. Setting rebuilds on the next tick.
     var segments: [ArcSegment] = [] {
-        didSet { fingerprint = nil; tick() }
+        didSet { geometryFingerprint = nil; tick() }
     }
 
     private static let shadowAlphaMin: CGFloat = 0.08
     private static let shadowAlphaMax: CGFloat = 0.5
 
     private var arcDisplayLink: CADisplayLink?
-    private var fingerprint: [Double]?
+    /// Fingerprint of the last geometry actually pushed to the layers — the
+    /// projected screen points of every segment. The arc is recomputed every tick
+    /// (so it follows MapKit's in-flight pan/zoom animation, which `map.convert`
+    /// reflects live even while `map.camera` still reads the target), but the
+    /// GPU-touching layer writes (`arcLayer.path = …`, `applyShadow`) are skipped
+    /// when those points are unchanged. Reassigning identical CALayer geometry at
+    /// 60 Hz otherwise keeps the Metal compositor busy every frame and makes the
+    /// map's annotation views ghost/float during interaction. Keyed off the
+    /// PROJECTED points (not `map.camera`) so a still map skips writes without the
+    /// during-animation freeze that a camera fingerprint caused.
+    private var geometryFingerprint: [CGFloat]?
 
     private let arcLayer: CAShapeLayer = {
         let l = CAShapeLayer()
@@ -214,7 +300,9 @@ fileprivate final class ShotArcOverlayView: NSView {
         arcLayer.contentsScale = scale
         shadowContainer.frame = bounds
         for s in shadowSegments { s.contentsScale = scale }
-        fingerprint = nil
+        // Bounds changed: the projected points move, so force the next tick to
+        // repush rather than compare against a stale fingerprint.
+        geometryFingerprint = nil
         tick()
     }
 
@@ -222,144 +310,198 @@ fileprivate final class ShotArcOverlayView: NSView {
 
     @objc private func tick() {
         guard let map = mapView else {
-            arcLayer.path = nil
-            clearShadow()
+            if geometryFingerprint != nil || arcLayer.path != nil {
+                geometryFingerprint = nil
+                arcLayer.path = nil
+                clearShadow()
+            }
             return
         }
-        let cam = map.camera
-        let center = cam.centerCoordinate
-        let fp: [Double] = [
-            center.latitude, center.longitude, cam.heading, Double(cam.pitch),
-            cam.centerCoordinateDistance,
-            Double(bounds.width), Double(bounds.height),
-            Double(segments.count)
-        ]
-        if let existing = fingerprint, existing == fp { return }
-        fingerprint = fp
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        defer { CATransaction.commit() }
-
+        // Per §7 of docs/shot-arc-rendering.md the arc geometry is recomputed on
+        // EVERY tick from the live projection (`map.convert`), so it tracks
+        // MapKit's internal pan/pitch/zoom animation — during which `map.camera`
+        // reports the *target*, not the in-flight, camera. But the GPU-touching
+        // layer writes below are gated on a fingerprint of the resulting projected
+        // points: on a still map the points don't change, so we skip the writes.
+        // Reassigning identical CALayer geometry at 60 Hz keeps the Metal
+        // compositor churning every frame and makes the map's annotation views
+        // ghost/float during interaction. (The gate is keyed off the projected
+        // points, NOT `map.camera`, so a settled map skips writes without the
+        // mid-animation freeze/drift a camera fingerprint would cause.)
         guard !segments.isEmpty else {
-            arcLayer.path = nil
-            clearShadow()
+            if geometryFingerprint != nil || arcLayer.path != nil {
+                geometryFingerprint = nil
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                arcLayer.path = nil
+                clearShadow()
+                CATransaction.commit()
+            }
             return
         }
 
-        // Camera pitch is the only per-frame input the arc height needs, and it's a
-        // stable scalar straight off the camera (no terrain sampling). Everything
-        // else about a shot's height is derived per-segment from the on-screen
-        // distance between its two projected marker points — see `arcGeometry`.
-        let pitchScale = CGFloat(sin(Double(map.camera.pitch) * .pi / 180))
-
+        // Each arc is a quadratic Bézier in screen space whose control point is
+        // composed from the shot's real apex/side (metres) times a live
+        // camera-derived basis — see `arcGeometry`. The ground shadow is a run of
+        // short straight segments along the *screen chord* between the same two
+        // projected endpoints (per §5.6 of the arc doc), bell-weighted so it's
+        // dark at takeoff/landing and faint under the apex.
         let combined = CGMutablePath()
         var shadowSpecs: [(path: CGPath, alpha: CGFloat)] = []
+        var fingerprint: [CGFloat] = []
         for seg in segments {
-            guard let g = arcGeometry(for: seg, on: map, pitchScale: pitchScale) else { continue }
-            combined.addPath(g.arc)
+            guard let g = arcGeometry(for: seg, on: map) else { continue }
+            fingerprint.append(g.start.x); fingerprint.append(g.start.y)
+            fingerprint.append(g.ctrl.x); fingerprint.append(g.ctrl.y)
+            fingerprint.append(g.end.x); fingerprint.append(g.end.y)
+            let arc = CGMutablePath()
+            arc.move(to: g.start)
+            arc.addQuadCurve(to: g.end, control: g.ctrl)
+            combined.addPath(arc)
 
-            // Ground shadow: connect consecutive projected ground samples (same
-            // points the arc rises from), dark at takeoff/landing and faint under
-            // the apex. Breaks the stroke across any behind-camera/off-screen sample
-            // exactly like the arc, so a prior shot's off-screen start never streaks.
-            let pts = g.groundSamples
-            guard pts.count == g.validity.count else { continue }
-            for i in 1..<pts.count {
-                guard g.validity[i - 1], g.validity[i] else { continue }
-                let uMid = (CGFloat(i) - 0.5) / CGFloat(pts.count - 1)
+            let n = Self.shadowSegmentCount
+            var prev = g.start
+            for i in 1...n {
+                let u = CGFloat(i) / CGFloat(n)
+                let next = CGPoint(x: g.start.x + (g.end.x - g.start.x) * u,
+                                   y: g.start.y + (g.end.y - g.start.y) * u)
+                let uMid = (CGFloat(i) - 0.5) / CGFloat(n)
                 let bell = 1 - 4 * uMid * (1 - uMid)  // 1 at ends, 0 at apex
                 let alpha = Self.shadowAlphaMin + (Self.shadowAlphaMax - Self.shadowAlphaMin) * bell
                 let p = CGMutablePath()
-                p.move(to: pts[i - 1])
-                p.addLine(to: pts[i])
+                p.move(to: prev)
+                p.addLine(to: next)
                 shadowSpecs.append((p, alpha))
+                prev = next
             }
         }
+
+        // Nothing moved on screen since the last push → skip the layer writes so
+        // the compositor stays idle and the markers don't ghost.
+        if let last = geometryFingerprint, last == fingerprint { return }
+        geometryFingerprint = fingerprint
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         arcLayer.path = combined
         applyShadow(shadowSpecs)
+        CATransaction.commit()
     }
 
     private struct ArcGeom {
-        let arc: CGPath
-        /// Projected ground point of each sample (no altitude lift) — the shadow
-        /// rides these.
-        let groundSamples: [CGPoint]
-        /// Per-sample validity (finite + within the sanity rect), so the shadow can
-        /// break across the same behind-camera/off-screen points the arc does.
-        let validity: [Bool]
+        /// Screen point of the shot's start marker (its glyph centre).
+        let start: CGPoint
+        /// Screen point of the shot's landing marker (its glyph centre).
+        let end: CGPoint
+        /// Quadratic-Bézier control point: `chordMid + 2·(altitude·H + side·S)`.
+        let ctrl: CGPoint
+        /// The visible peak of the rendered curve, `(chordMid + ctrl)/2`.
+        let apex: CGPoint
+        /// Midpoint of the two projected endpoints; the offset base.
+        let chordMid: CGPoint
+        /// Screen pixels per metre of world altitude, `sin(pitch)·imagePlanePpm`.
+        let altitudePxPerM: CGFloat
+        /// Screen vector for one metre of ground travel perpendicular to the chord.
+        let sideDirPxPerM: CGPoint
     }
 
-    /// Number of world-space samples per arc. The parabola is walked in ground
-    /// parameter space and each sample is projected live, so the curve tracks the
-    /// terrain at every camera angle instead of relying on one screen-space
-    /// control point (which drifts/overshoots under perspective).
-    private static let arcSamples = 40
+    /// Number of straight segments used to draw the ground shadow along the chord.
+    private static let shadowSegmentCount = 24
 
-    /// Fraction of a shot's on-screen chord length used as its apex height (before
-    /// the pitch scale). Larger = taller arcs. A single knob for the flight look.
-    private static let apexRatio: CGFloat = 0.22
-    /// Apex height clamp in screen points, so a very short chip still lifts a
-    /// little and a long drive doesn't balloon off the top of the screen.
-    private static let apexMinPx: CGFloat = 6
-    private static let apexMaxPx: CGFloat = 200
-
-    private func arcGeometry(for seg: ArcSegment, on map: MKMapView, pitchScale: CGFloat) -> ArcGeom? {
-        let startPt = map.convert(seg.from, toPointTo: self)
-        let endPt = map.convert(seg.to, toPointTo: self)
-        let chord = hypot(endPt.x - startPt.x, endPt.y - startPt.y)
-        guard chord > 0.5 else { return nil }
-        guard Geo.distance(seg.from, seg.to) > 0.1 else { return nil }
-
-        // Apex height is measured directly in SCREEN pixels: a fraction of the
-        // on-screen chord between the two projected marker points, scaled by the
-        // camera pitch (flat/top-down => no bulge) and clamped. Because it depends
-        // only on the two endpoint projections and a stable pitch scalar — never a
-        // per-frame terrain probe — the height glides smoothly as the camera moves
-        // instead of pulsing with the streaming `.realistic` elevation mesh. The
-        // chord naturally foreshortens with perspective and shrinks with zoom, so
-        // the arc stays proportionate at every camera angle.
-        let apexPx = min(max(chord * Self.apexRatio, Self.apexMinPx), Self.apexMaxPx) * pitchScale
-
-        // Walk the flight in ground-parameter space. Each sample's ground point is
-        // projected live through the camera so the curve rides the true ground path
-        // (and its terrain), then lifted straight up the screen by its parabolic
-        // height fraction × the screen-space apex. f=0 and f=1 lift by zero, so the
-        // arc's two ends sit EXACTLY on the projected marker coordinates — anchored
-        // to the tee/shot glyphs at every camera angle. Positive screen-Y is up
-        // (the view is unflipped).
-        //
-        // `map.convert(_:toPointTo:)` returns garbage for coordinates behind the
-        // camera or beyond the horizon (common when zoomed in close: a prior shot's
-        // start point sits behind the viewpoint), which projects to a wild screen
-        // point and streaks an errant line across the view. Guard each sample against
-        // a generous sanity rect and BREAK the stroke (move, don't line) across any
-        // invalid point so only the on-screen, valid portion of the arc is drawn.
-        let sanity = bounds.insetBy(dx: -bounds.width * 2, dy: -bounds.height * 2)
-        let arc = CGMutablePath()
-        var groundSamples: [CGPoint] = []
-        var validity: [Bool] = []
-        let n = Self.arcSamples
-        var penDown = false
-        for i in 0...n {
-            let f = CGFloat(i) / CGFloat(n)
-            let coord = CLLocationCoordinate2D(
-                latitude: seg.from.latitude + (seg.to.latitude - seg.from.latitude) * Double(f),
-                longitude: seg.from.longitude + (seg.to.longitude - seg.from.longitude) * Double(f))
-            let groundPt = map.convert(coord, toPointTo: self)
-            let lift = 4 * f * (1 - f) * apexPx  // parabola: 0 at ends, apex at f=0.5
-            let pt = CGPoint(x: groundPt.x, y: groundPt.y + lift)
-            let valid = pt.x.isFinite && pt.y.isFinite && groundPt.x.isFinite
-                && groundPt.y.isFinite && sanity.contains(pt)
-            groundSamples.append(groundPt)
-            validity.append(valid)
-            if valid {
-                if penDown { arc.addLine(to: pt) } else { arc.move(to: pt); penDown = true }
-            } else {
-                penDown = false
+    /// Screen point (in this overlay's space) of the *rendered marker view* whose
+    /// coordinate matches `coord`, per §6 of the arc doc. This is the anchoring
+    /// trick: the arc foot is pinned to the numbered shot marker's on-screen
+    /// pixel centre by reading the annotation view's actual frame — NOT by
+    /// re-deriving it from `map.convert(coord, toPointTo:)`. On macOS the
+    /// geographic `convert(_:toPointTo:subview)` does not reproduce where MapKit
+    /// actually lays out its annotation views (they can differ by tens of points),
+    /// so relying on it alone lets the arc float away from its marker. Returns
+    /// `nil` only when no realized view exists yet, letting the caller fall back.
+    private func annotationPoint(for coord: CLLocationCoordinate2D, on map: MKMapView) -> CGPoint? {
+        for ann in map.annotations {
+            if abs(ann.coordinate.latitude - coord.latitude) < 1e-7,
+               abs(ann.coordinate.longitude - coord.longitude) < 1e-7,
+               let v = map.view(for: ann) {
+                let centerInMap = NSPoint(x: v.frame.midX, y: v.frame.midY)
+                return map.convert(centerInMap, to: self)
             }
         }
-        return ArcGeom(arc: arc, groundSamples: groundSamples, validity: validity)
+        return nil
+    }
+
+    /// Returns the screen-space vector that one metre of ground travel along
+    /// `bearingDeg` at `origin` projects to under the current camera. Probes a
+    /// 10 m baseline centred on `origin` and divides by 10 so the result is
+    /// robust to map-coordinate non-linearity over short distances. Carries both
+    /// the direction and the (foreshortened) magnitude of a metre on screen.
+    private func groundUnitProjection(from origin: CLLocationCoordinate2D,
+                                      bearingDeg: Double,
+                                      map: MKMapView) -> CGPoint {
+        let half: Double = 5
+        let a = Geo.destination(from: origin, bearingDeg: bearingDeg, distance_m: half)
+        let b = Geo.destination(from: origin,
+                                bearingDeg: (bearingDeg + 180).truncatingRemainder(dividingBy: 360),
+                                distance_m: half)
+        let aPt = map.convert(a, toPointTo: self)
+        let bPt = map.convert(b, toPointTo: self)
+        return CGPoint(x: (aPt.x - bPt.x) / 10, y: (aPt.y - bPt.y) / 10)
+    }
+
+    /// Builds one arc's screen-space geometry from the live camera, exactly per
+    /// `docs/shot-arc-rendering.md` §5.
+    private func arcGeometry(for seg: ArcSegment, on map: MKMapView) -> ArcGeom? {
+        // 5.1 — project the endpoints, snapped to the numbered marker's on-screen
+        // pixel centre (per §6). `annotationPoint` reads the realized annotation
+        // view's frame; only when the marker isn't realized yet do we fall back to
+        // the geographic projection. Anchoring to the marker view — not the raw
+        // `map.convert` — is what keeps the arc foot glued to its shot counter on
+        // macOS, where geographic-convert-to-a-subview doesn't match MapKit's own
+        // annotation layout.
+        let startPt = annotationPoint(for: seg.from, on: map) ?? map.convert(seg.from, toPointTo: self)
+        let endPt = annotationPoint(for: seg.to, on: map) ?? map.convert(seg.to, toPointTo: self)
+        guard startPt.x.isFinite, startPt.y.isFinite, endPt.x.isFinite, endPt.y.isFinite else { return nil }
+        let chord = hypot(endPt.x - startPt.x, endPt.y - startPt.y)
+        guard chord > 0.5 else { return nil }
+        let ground_m = Geo.distance(seg.from, seg.to)
+        guard ground_m > 0.1 else { return nil }
+
+        // The apex and side are world-space quantities (metres). Recover the live
+        // basis vectors by probing real ground geometry at the chord midpoint.
+        let midCoord = CLLocationCoordinate2D(
+            latitude: (seg.from.latitude + seg.to.latitude) / 2,
+            longitude: (seg.from.longitude + seg.to.longitude) / 2)
+
+        // 5.3 — side/curve basis: one metre perpendicular to the world chord.
+        let chordBearing = Geo.initialBearing(seg.from, seg.to)
+        let sidePerpBearing = (chordBearing + 90).truncatingRemainder(dividingBy: 360)
+        let sideDirPxPerM = groundUnitProjection(from: midCoord, bearingDeg: sidePerpBearing, map: map)
+
+        // 5.2 — altitude basis: world-up projects to screen-Y (zero camera roll);
+        // magnitude = sin(pitch) × unforeshortened ppm sampled along the
+        // camera-heading-perpendicular (image-plane) axis.
+        let pitchRad = Double(map.camera.pitch) * .pi / 180
+        let viewPerpBearing = (map.camera.heading + 90).truncatingRemainder(dividingBy: 360)
+        let viewPerpVec = groundUnitProjection(from: midCoord, bearingDeg: viewPerpBearing, map: map)
+        let unforeshortenedPpm = hypot(viewPerpVec.x, viewPerpVec.y)
+        let altitudePxPerM = unforeshortenedPpm * CGFloat(sin(pitchRad))
+
+        // 5.4 — compose the control point. A quadratic Bézier's t=0.5 point is
+        // 0.5·chordMid + 0.5·ctrl, so `ctrl = chordMid + 2·offset` puts the
+        // visible apex exactly at `chordMid + offset`. The view is unflipped
+        // (screen-up = +y), so the altitude term ADDS to y.
+        let chordMid = CGPoint(x: (startPt.x + endPt.x) / 2, y: (startPt.y + endPt.y) / 2)
+        let H = CGFloat(seg.apexHeight_m)
+        let S = CGFloat(seg.sideCurve_m)
+        let ctrl = CGPoint(
+            x: chordMid.x + sideDirPxPerM.x * S * 2,
+            y: chordMid.y + altitudePxPerM * H * 2 + sideDirPxPerM.y * S * 2)
+        guard ctrl.x.isFinite, ctrl.y.isFinite else { return nil }
+        let apex = CGPoint(x: (chordMid.x + ctrl.x) / 2, y: (chordMid.y + ctrl.y) / 2)
+
+        return ArcGeom(start: startPt, end: endPt, ctrl: ctrl, apex: apex,
+                       chordMid: chordMid,
+                       altitudePxPerM: altitudePxPerM, sideDirPxPerM: sideDirPxPerM)
     }
 
     private func applyShadow(_ specs: [(path: CGPath, alpha: CGFloat)]) {
@@ -732,7 +874,12 @@ extension CourseMapView {
             currentHoleID = currentHole?.osmIdentifier
             let segments = shotSegments(shots: shots, currentHole: currentHole)
             arcOverlay?.segments = segments.map {
-                ShotArcOverlayView.ArcSegment(from: $0.from, to: $0.to)
+                ShotArcOverlayView.ArcSegment(
+                    from: $0.from,
+                    to: $0.to,
+                    apexHeight_m: $0.apexHeight_m,
+                    sideCurve_m: $0.sideCurve_m
+                )
             }
             syncMapConfiguration(map: map, style: style)
             syncOverlays(
@@ -1582,6 +1729,10 @@ extension CourseMapView {
             let to: CLLocationCoordinate2D
             let midpoint: CLLocationCoordinate2D
             let meters: Double
+            /// Apex height in metres, from the shot's generated measurement.
+            let apexHeight_m: Double
+            /// Lateral shape in metres (signed), from the shot's measurement.
+            let sideCurve_m: Double
         }
 
         /// Creates one segment per recorded shot. Shot 1 starts at the hole tee
@@ -1608,7 +1759,9 @@ extension CourseMapView {
                     from: from,
                     to: shot.coordinate,
                     midpoint: midpoint,
-                    meters: meters
+                    meters: meters,
+                    apexHeight_m: shot.apexHeight_m,
+                    sideCurve_m: shot.sideCurve_m
                 ))
                 previous = shot.coordinate
             }
