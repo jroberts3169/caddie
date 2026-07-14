@@ -14,6 +14,15 @@ struct PlayDetailPane: View {
     let shots: [Shot]
     let onClearShots: () -> Void
     let onUndoShot: () -> Void
+    /// Records a shot at the current hole's pin. Only used by UI automation via a
+    /// hidden button; normal play records shots by clicking the map.
+    let onAddShotAtPin: () -> Void
+    /// Whether the focused hole has been marked complete ("holed out").
+    let isComplete: Bool
+    /// Marks the focused hole complete, adding a final shot to the pin if needed.
+    let onFinishHole: () -> Void
+    /// Reopens a completed hole for further editing.
+    let onReopenHole: () -> Void
 
     @Environment(OverlaySettings.self) private var settings
 
@@ -92,7 +101,7 @@ struct PlayDetailPane: View {
             // ── Hole stats ──────────────────────────────────────────────────
             if let hole = currentHole {
                 VStack(spacing: 20) {
-                    statRow(label: "Par", value: hole.par.map { "\($0)" } ?? "—")
+                    statRow(label: "Par", value: hole.par.map { "\($0)" } ?? "—", identifier: "parStatValue")
                     if let meters = hole.effectiveLengthMeters {
                         if settings.useMetricDistance {
                             statRow(label: "Meters", value: "\(Int(meters.rounded()))")
@@ -136,6 +145,17 @@ struct PlayDetailPane: View {
                 .disabled(!canGoToNextHole)
                 .hidden()
         }
+        .background {
+            // Hidden UI-automation hook: records a shot at the current hole's pin
+            // without needing a positional map click. Driven by a keyboard shortcut
+            // (⇧⌘P) — the same hidden-button+shortcut idiom the nav/undo buttons use,
+            // since a `.hidden()` button isn't hittable by a click in XCUITest.
+            Button("Add Shot At Pin", action: onAddShotAtPin)
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(currentHole == nil)
+                .hidden()
+                .accessibilityIdentifier("addShotButton")
+        }
     }
 
     // MARK: - Shots
@@ -150,6 +170,8 @@ struct PlayDetailPane: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                    .accessibilityIdentifier("shotCountLabel")
+                    .accessibilityValue("\(shots.count)")
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
@@ -195,6 +217,56 @@ struct PlayDetailPane: View {
                 .padding(.vertical, 12)
                 .accessibilityIdentifier("clearShotsButton")
             }
+
+            finishHoleSection
+        }
+    }
+
+    // MARK: - Finish hole
+
+    /// The stroke count vs. par when the hole is complete, e.g. "4 strokes · Par".
+    private var scoreSummary: String {
+        let strokes = shots.count
+        let strokeText = "\(strokes) stroke\(strokes == 1 ? "" : "s")"
+        guard let par = currentHole?.par else { return strokeText }
+        let diff = strokes - par
+        let relative: String
+        switch diff {
+        case 0: relative = "Par"
+        case ..<0: relative = "\(diff)"          // e.g. "-1"
+        default: relative = "+\(diff)"           // e.g. "+2"
+        }
+        return "\(strokeText) · \(relative)"
+    }
+
+    @ViewBuilder
+    private var finishHoleSection: some View {
+        if currentHole != nil {
+            Divider()
+            VStack(spacing: 12) {
+                if isComplete {
+                    Label(scoreSummary, systemImage: "flag.checkered")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityIdentifier("holeCompleteLabel")
+                        .accessibilityValue(scoreSummary)
+
+                    Button(action: onReopenHole) {
+                        Label("Reopen Hole", systemImage: "arrow.uturn.backward")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .accessibilityIdentifier("reopenHoleButton")
+                } else {
+                    Button(action: onFinishHole) {
+                        Label("Finish Hole", systemImage: "flag.checkered")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("finishHoleButton")
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
         }
     }
 
@@ -251,7 +323,7 @@ struct PlayDetailPane: View {
         return "Hole \(index + 1)"
     }
 
-    private func statRow(label: String, value: String) -> some View {
+    private func statRow(label: String, value: String, identifier: String? = nil) -> some View {
         HStack {
             Text(label)
                 .foregroundStyle(.secondary)
@@ -259,6 +331,8 @@ struct PlayDetailPane: View {
             Text(value)
                 .fontWeight(.semibold)
                 .monospacedDigit()
+                .accessibilityIdentifier(identifier ?? "")
+                .accessibilityValue(identifier != nil ? value : "")
         }
         .font(.body)
     }

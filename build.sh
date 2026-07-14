@@ -115,6 +115,99 @@ if [[ "${1:-}" == "profile" ]]; then
   exit 0
 fi
 
+# profile-ui: drive the app with a UI test (default testCompleteHoleAtPar) while a
+# Time Profiler attaches to it, then export the trace and print a per-symbol
+# heatmap via profiles/analyze.py. Fully automated — a repeatable "why is the
+# framerate slow" breakdown of the whole play-through path (course select → mode
+# switch → hole flyovers → shots → finish). Optional 2nd arg overrides the test.
+#
+#   ./build.sh profile-ui
+#   ./build.sh profile-ui caddieUITests/caddieUITests/testCompleteHoleAtPar
+if [[ "${1:-}" == "profile-ui" ]]; then
+  TEST="${2:-caddieUITests/caddieUITests/testCompleteHoleAtPar}"
+  STAMP="$(date +%Y%m%d-%H%M%S)"
+  TRACE="profiles/${SCHEME}-ui-${STAMP}.trace"
+  XML="profiles/${SCHEME}-ui-${STAMP}.xml"
+  TESTLOG="profiles/${SCHEME}-ui-${STAMP}.testlog"
+  # Ad-hoc sign so the XCUITest runner launches; CODE_SIGNING_ALLOWED stays YES.
+  SIGN=(CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES)
+
+  quit_app
+  # Clear the persisted (possibly fullscreen) window state so the sidebar search
+  # field is in the a11y tree — otherwise the course-select step can't find it.
+  defaults delete com.okjeffrey.caddie 2>/dev/null || true
+
+  mkdir -p profiles
+  echo "Running UI test ($TEST) in Release; Time Profiler will attach…"
+
+  # -configuration Release gives realistic, optimized frame timings (Debug is far
+  # too slow to trust for framerate work). Accessibility identifiers are compiled
+  # in regardless of configuration. ENABLE_TESTABILITY=YES keeps -O optimizations
+  # while re-enabling `@testable import caddie` (the unit-test target is built even
+  # when only the UI test runs, and its testable import fails in a plain Release
+  # build). Run in the background so we can attach xctrace to the app it launches.
+  xcodebuild test \
+    -project "$PROJECT" \
+    -scheme "$SCHEME" \
+    -destination "platform=macOS" \
+    -configuration Release \
+    -only-testing:"$TEST" \
+    ENABLE_TESTABILITY=YES \
+    "${SIGN[@]}" \
+    > "$TESTLOG" 2>&1 &
+  TEST_PID=$!
+
+  echo "Waiting for ${SCHEME} to launch (building Release first)…"
+  APP_PID=""
+  for _ in $(seq 1 900); do
+    if ! kill -0 "$TEST_PID" 2>/dev/null; then
+      echo "xcodebuild exited before the app launched; see $TESTLOG" >&2
+      exit 1
+    fi
+    APP_PID="$(pgrep -x "$SCHEME" | head -1 || true)"
+    [[ -n "$APP_PID" ]] && break
+    sleep 0.2
+  done
+  if [[ -z "$APP_PID" ]]; then
+    echo "Timed out waiting for ${SCHEME} to launch; see $TESTLOG" >&2
+    kill "$TEST_PID" 2>/dev/null || true
+    exit 1
+  fi
+
+  echo "Attaching '${TEMPLATE}' to PID $APP_PID → $TRACE"
+  # xctrace finalizes on target-exit or the time limit; don't let set -e abort.
+  set +e
+  xcrun xctrace record \
+    --template "$TEMPLATE" \
+    --attach "$APP_PID" \
+    --time-limit 120s \
+    --output "$TRACE"
+  set -e
+
+  wait "$TEST_PID" 2>/dev/null || true
+
+  if [[ ! -d "$TRACE" ]]; then
+    echo "No trace was written; see $TESTLOG" >&2
+    exit 1
+  fi
+  echo "Saved: $TRACE"
+
+  echo "Exporting time-profile table → $XML"
+  xcrun xctrace export \
+    --input "$TRACE" \
+    --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
+    > "$XML"
+
+  echo
+  echo "================ HEATMAP (profiles/analyze.py) ================"
+  python3 profiles/analyze.py "$XML"
+  echo
+  echo "Trace: $TRACE"
+  echo "XML:   $XML"
+  echo "Open the full timeline in Instruments with: open \"$TRACE\""
+  exit 0
+fi
+
 # dist: build a Release binary, sign with Developer ID, notarize with Apple, and
 # staple the ticket — producing a Gatekeeper-approved .app ready to share.
 #

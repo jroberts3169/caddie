@@ -262,6 +262,10 @@ struct ContentView: View {
     /// Recorded shots keyed by hole OSM id, for the displayed course. Reset when a
     /// new course is selected.
     @State private var shotsByHole: [Int64: [Shot]] = [:]
+    /// OSM ids of holes the user has marked complete ("holed out"). A completed
+    /// hole locks its score summary; recording another shot reopens it. Reset when
+    /// a new course is selected.
+    @State private var completedHoles: Set<Int64> = []
     /// Region the user has panned/zoomed to on the nearby map but not yet searched;
     /// non-nil drives the "Search here" button. Cleared once a search runs.
     @State private var pendingSearchRegion: MKCoordinateRegion?
@@ -322,6 +326,7 @@ struct ContentView: View {
                 activeSubCourseID = nil
                 currentHoleIndex = 0
                 shotsByHole = [:]
+                completedHoles = []
                 pendingSearchRegion = nil
                 framedFootprintCourseID = nil
                 featureRenderTask?.cancel()
@@ -356,6 +361,7 @@ struct ContentView: View {
             activeSubCourseID = nil
             currentHoleIndex = 0
             shotsByHole = [:]
+            completedHoles = []
             pendingSearchRegion = nil
             framedFootprintCourseID = nil
             // Stop any progressive overlay render still painting the previous course.
@@ -559,6 +565,12 @@ struct ContentView: View {
         return shotsByHole[id] ?? []
     }
 
+    /// Whether the currently focused hole has been marked complete ("holed out").
+    private var isCurrentHoleComplete: Bool {
+        guard let id = currentHoleID else { return false }
+        return completedHoles.contains(id)
+    }
+
     /// Appends a shot at `coordinate` to the currently focused hole.
     ///
     /// The tapped point is the landing; the shot is struck from the tee (first
@@ -571,6 +583,8 @@ struct ContentView: View {
     private func addShotToCurrentHole(_ coordinate: CLLocationCoordinate2D) {
         guard let id = currentHoleID,
               courseHoles.indices.contains(currentHoleIndex) else { return }
+        // Recording another shot reopens a hole that was marked complete.
+        completedHoles.remove(id)
         let hole = courseHoles[currentHoleIndex]
 
         let existing = shotsByHole[id] ?? []
@@ -626,6 +640,49 @@ struct ContentView: View {
     private func clearCurrentHoleShots() {
         guard let id = currentHoleID else { return }
         shotsByHole[id] = nil
+        completedHoles.remove(id)
+    }
+
+    /// Marks the currently focused hole complete ("holes out"), mirroring golf-gen:
+    /// if the player isn't already at the pin, a final shot to the pin is recorded
+    /// first, then the hole is locked. No-op if already complete or geometry is
+    /// missing. Reached from the Play pane button and a right-click on the map pin.
+    private func finishCurrentHole() {
+        guard let id = currentHoleID,
+              courseHoles.indices.contains(currentHoleIndex),
+              !completedHoles.contains(id) else { return }
+        let hole = courseHoles[currentHoleIndex]
+        guard let pin = hole.coordinates.last.map({
+            CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+        }) else { return }
+
+        // The shot is struck from the last landing, else the tee. Add a final shot
+        // to the pin unless the player is already effectively on top of it.
+        let start = (shotsByHole[id] ?? []).last?.land
+            ?? hole.coordinates.first.map {
+                CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+            }
+        if let start, Geo.distance(start, pin) > 0.3 {
+            // `addShotToCurrentHole` clears the completion flag, so mark complete
+            // *after* it runs.
+            addShotToCurrentHole(pin)
+        }
+        completedHoles.insert(id)
+    }
+
+    /// Reopens the currently focused hole for further editing (undoes "holed out").
+    private func reopenCurrentHole() {
+        guard let id = currentHoleID else { return }
+        completedHoles.remove(id)
+    }
+
+    /// Records a shot at the current hole's pin (its last coordinate). Used only by
+    /// UI automation via the hidden `addShotButton`; normal play records shots by
+    /// clicking the map. No-op when the hole has no geometry.
+    private func addShotAtCurrentHolePin() {
+        guard courseHoles.indices.contains(currentHoleIndex),
+              let pin = courseHoles[currentHoleIndex].coordinates.last else { return }
+        addShotToCurrentHole(CLLocationCoordinate2D(latitude: pin.lat, longitude: pin.lon))
     }
 
     /// Removes the most recently recorded shot on the currently focused hole, e.g.
@@ -634,6 +691,7 @@ struct ContentView: View {
         guard let id = currentHoleID, var holeShots = shotsByHole[id], !holeShots.isEmpty else { return }
         holeShots.removeLast()
         shotsByHole[id] = holeShots.isEmpty ? nil : holeShots
+        completedHoles.remove(id)
     }
 
     /// Switches the Play focus to the hole with the given OSM id, e.g. when its
@@ -659,6 +717,7 @@ struct ContentView: View {
             hoverLocation: mapHoverLocation,
             onAddShot: addShotToCurrentHole,
             onSelectHole: selectHole(withID:),
+            onFinishHole: finishCurrentHole,
             onSelectCourse: { identifier in
                 // Tapping a nearby course flag opens that course, exactly as if it
                 // had been picked from the sidebar.
@@ -736,7 +795,11 @@ struct ContentView: View {
             currentHoleIndex: $currentHoleIndex,
             shots: currentHoleShots,
             onClearShots: clearCurrentHoleShots,
-            onUndoShot: undoLastShot
+            onUndoShot: undoLastShot,
+            onAddShotAtPin: addShotAtCurrentHolePin,
+            isComplete: isCurrentHoleComplete,
+            onFinishHole: finishCurrentHole,
+            onReopenHole: reopenCurrentHole
         )
     }
 

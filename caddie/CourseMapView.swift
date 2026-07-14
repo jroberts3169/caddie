@@ -230,13 +230,22 @@ fileprivate final class ShotArcOverlayView: NSView {
 
     /// The shot segments to draw. Setting rebuilds on the next tick.
     var segments: [ArcSegment] = [] {
-        didSet { geometryFingerprint = nil; tick() }
+        didSet { geometryFingerprint = nil; resumeTicking(); tick() }
     }
 
     private static let shadowAlphaMin: CGFloat = 0.08
     private static let shadowAlphaMax: CGFloat = 0.5
 
     private var arcDisplayLink: CADisplayLink?
+    /// Consecutive ticks whose projected geometry was identical to the last. Once
+    /// this reaches `idlePauseAfterFrames` the display link pauses itself: on a
+    /// still map the arc can't change, so there's no reason to keep recomputing
+    /// `arcGeometry`/`annotationPoint` every frame (that per-frame CPU cost showed
+    /// up as the dominant app-side main-thread work in the Time Profiler). The
+    /// link is woken again by `resumeTicking()` whenever the projection can move —
+    /// new segments, a bounds change, or a MapKit region will/did-change.
+    private var idleFrames = 0
+    private static let idlePauseAfterFrames = 12
     /// Fingerprint of the last geometry actually pushed to the layers — the
     /// projected screen points of every segment. The arc is recomputed every tick
     /// (so it follows MapKit's in-flight pan/zoom animation, which `map.convert`
@@ -290,7 +299,21 @@ fileprivate final class ShotArcOverlayView: NSView {
         // between delegate callbacks, and is ProMotion-aware.
         let link = displayLink(target: self, selector: #selector(tick))
         link.add(to: .main, forMode: .common)
+        // Start idle; `resumeTicking()` only spins it up when there's an arc to
+        // draw. Prevents a permanent full-refresh-rate tick with no shots present.
+        link.isPaused = true
         arcDisplayLink = link
+        resumeTicking()
+    }
+
+    /// Wake the display link so `tick()` runs again. Called whenever something
+    /// that can change the on-screen arc begins: new segments, a bounds change,
+    /// or the map starting/finishing a region change. The link idles itself back
+    /// to paused once the projected geometry has been stable for
+    /// `idlePauseAfterFrames` frames.
+    func resumeTicking() {
+        idleFrames = 0
+        if window != nil, !segments.isEmpty { arcDisplayLink?.isPaused = false }
     }
 
     override func layout() {
@@ -303,6 +326,7 @@ fileprivate final class ShotArcOverlayView: NSView {
         // Bounds changed: the projected points move, so force the next tick to
         // repush rather than compare against a stale fingerprint.
         geometryFingerprint = nil
+        resumeTicking()
         tick()
     }
 
@@ -315,6 +339,7 @@ fileprivate final class ShotArcOverlayView: NSView {
                 arcLayer.path = nil
                 clearShadow()
             }
+            arcDisplayLink?.isPaused = true
             return
         }
 
@@ -338,6 +363,9 @@ fileprivate final class ShotArcOverlayView: NSView {
                 clearShadow()
                 CATransaction.commit()
             }
+            // No shots to draw → nothing to animate. Sleep the link until
+            // `segments` is set again (which resumes it via `didSet`).
+            arcDisplayLink?.isPaused = true
             return
         }
 
@@ -378,8 +406,16 @@ fileprivate final class ShotArcOverlayView: NSView {
         }
 
         // Nothing moved on screen since the last push → skip the layer writes so
-        // the compositor stays idle and the markers don't ghost.
-        if let last = geometryFingerprint, last == fingerprint { return }
+        // the compositor stays idle and the markers don't ghost. After the
+        // projection has been stable for a short run of frames, pause the link
+        // entirely: a still map can't change the arc, so further ticks are pure
+        // waste until something wakes us via `resumeTicking()`.
+        if let last = geometryFingerprint, last == fingerprint {
+            idleFrames += 1
+            if idleFrames >= Self.idlePauseAfterFrames { arcDisplayLink?.isPaused = true }
+            return
+        }
+        idleFrames = 0
         geometryFingerprint = fingerprint
 
         CATransaction.begin()
@@ -596,6 +632,9 @@ struct CourseMapView: NSViewRepresentable {
     var onAddShot: (CLLocationCoordinate2D) -> Void
     /// Called with a hole's OSM id when its tee marker is tapped in Play mode.
     var onSelectHole: (Int64) -> Void
+    /// Called when the focused hole's pin is right-clicked in Play mode, to mark
+    /// the hole complete ("hole out").
+    var onFinishHole: () -> Void
     /// Called with a nearby course's identifier when its flag is tapped on the
     /// browse map, so that course can be opened.
     var onSelectCourse: (String) -> Void
@@ -644,6 +683,19 @@ struct CourseMapView: NSViewRepresentable {
         click.delegate = context.coordinator
         map.addGestureRecognizer(click)
 
+        // Right-click → finish (hole out) the focused hole, handled at the MAP
+        // level by hit-testing the current hole's pin glyph rather than on the
+        // pin's own view. A per-view right-click recognizer is unreliable for the
+        // same gesture-priority reasons taps are (MapKit's recognizers can win
+        // first); a map-level recognizer that hit-tests the pin is robust.
+        let rightClick = NSClickGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleMapRightClick(_:))
+        )
+        rightClick.buttonMask = 0x2
+        rightClick.numberOfClicksRequired = 1
+        map.addGestureRecognizer(rightClick)
+
         return container
     }
 
@@ -651,6 +703,7 @@ struct CourseMapView: NSViewRepresentable {
         guard let map = context.coordinator.map else { return }
         context.coordinator.onAddShot = onAddShot
         context.coordinator.onSelectHole = onSelectHole
+        context.coordinator.onFinishHole = onFinishHole
         context.coordinator.onSelectCourse = onSelectCourse
         context.coordinator.onCameraMoved = onCameraMoved
         context.coordinator.isPlayMode = isPlayMode
@@ -811,6 +864,8 @@ extension CourseMapView {
         var onAddShot: ((CLLocationCoordinate2D) -> Void)?
         /// Called with a tapped tee's hole OSM id while in Play mode.
         var onSelectHole: ((Int64) -> Void)?
+        /// Called when the focused hole's pin is right-clicked in Play mode.
+        var onFinishHole: (() -> Void)?
         /// Called with a tapped nearby course's identifier on the browse map.
         var onSelectCourse: ((String) -> Void)?
         /// Called with the new region after a user-initiated pan/zoom.
@@ -966,6 +1021,22 @@ extension CourseMapView {
 
             let coordinate = map.convert(point, toCoordinateFrom: map)
             onAddShot?(coordinate)
+        }
+
+        /// Map-level right-click: if it landed on the focused hole's pin glyph,
+        /// finish ("hole out") that hole. Only the current hole's pin is a target —
+        /// right-clicking another hole's pin, or an empty spot, is a no-op. Play
+        /// mode only (`onFinishHole` is nil otherwise).
+        @objc func handleMapRightClick(_ gesture: NSClickGestureRecognizer) {
+            guard let map, isPlayMode, let currentHoleID, onFinishHole != nil else { return }
+            let point = gesture.location(in: map)
+            for pin in map.annotations.compactMap({ $0 as? HolePinAnnotation })
+            where pin.osmIdentifier == currentHoleID {
+                if markerHitRect(for: pin, in: map).contains(point) {
+                    onFinishHole?()
+                    return
+                }
+            }
         }
 
         // MARK: Hover
@@ -1201,6 +1272,10 @@ extension CourseMapView {
         /// resulting callback is recognized as ours and filtered out — everything
         /// else is the user dragging or zooming.
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            // The map settled (or an instant, non-animated jump completed) — wake
+            // the shot-arc overlay so it redraws once at the new projection, then
+            // idles itself back to paused.
+            arcOverlay?.resumeTicking()
             if isApplyingRegion {
                 isApplyingRegion = false
                 hasFramedOnce = true
@@ -1208,6 +1283,15 @@ extension CourseMapView {
             }
             guard hasFramedOnce else { return }
             onCameraMoved?(mapView.region)
+        }
+
+        /// A region change is beginning — a user pan/zoom/pitch or a programmatic
+        /// `setRegion` animation. Wake the shot-arc overlay's display link so the
+        /// arc tracks MapKit's in-flight animation; it idles itself back to paused
+        /// once the projected geometry stabilizes. Without this, a link paused
+        /// while the map was still would leave the arc frozen during the motion.
+        func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+            arcOverlay?.resumeTicking()
         }
 
         /// The app drives all marker emphasis itself (hole focus, the flag on the
