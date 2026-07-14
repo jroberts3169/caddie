@@ -313,7 +313,25 @@ fileprivate final class ShotArcOverlayView: NSView {
     /// `idlePauseAfterFrames` frames.
     func resumeTicking() {
         idleFrames = 0
+        pinZOrder()
         if window != nil, !segments.isEmpty { arcDisplayLink?.isPaused = false }
+    }
+
+    /// Force this overlay to the bottom of the map's subview stack so it always
+    /// renders BEHIND the annotation views (tee/pin/shot glyphs). The overlay is
+    /// added `.below` once at setup, but MapKit re-orders its own subviews every
+    /// frame during pan/zoom/flyover; if the arc drifts above the annotation
+    /// views, redrawing its layer forces those mid-animation glyphs to
+    /// recomposite at stale positions → the shot markers smear/ghost. Re-pinning
+    /// each tick (golf-gen's `sortSubviews` trick) keeps the arc strictly behind
+    /// the glyphs, so its redraws never disturb them.
+    private func pinZOrder() {
+        guard let parent = superview, parent === mapView else { return }
+        parent.sortSubviews({ a, b, _ in
+            if a is ShotArcOverlayView { return .orderedAscending }
+            if b is ShotArcOverlayView { return .orderedDescending }
+            return .orderedSame
+        }, context: nil)
     }
 
     override func layout() {
@@ -342,6 +360,11 @@ fileprivate final class ShotArcOverlayView: NSView {
             arcDisplayLink?.isPaused = true
             return
         }
+
+        // Keep the arc strictly behind MapKit's annotation views every frame; it
+        // reorders its subviews during interaction and a drifted overlay smears
+        // the shot glyphs when it redraws. See `pinZOrder`.
+        pinZOrder()
 
         // Per §7 of docs/shot-arc-rendering.md the arc geometry is recomputed on
         // EVERY tick from the live projection (`map.convert`), so it tracks
@@ -893,6 +916,20 @@ extension CourseMapView {
         private var appliedHoleTitleHash: Int?
         /// Hash of the inputs that determine the shot annotation set.
         private var appliedShotAnnotationHash: Int?
+        /// Drives the per-hole camera glide frame-by-frame (60 Hz). MapKit's own
+        /// `setCamera(animated: true)` runs implicit CoreAnimation across the whole
+        /// annotation container, so any marker churn during the flight (e.g. the
+        /// outgoing hole's shots being removed) smears EVERY glyph ("ghosting").
+        /// Interpolating the camera ourselves and applying each frame with
+        /// `animated: false` means MapKit runs no implicit annotation animation, so
+        /// markers never ghost. Ported from golf-gen's `animatePitch`.
+        private var cameraTimer: Timer?
+        /// True for the whole duration of a `cameraTimer` glide. Each frame applies
+        /// `setCamera(animated: false)`, which fires `regionDidChangeAnimated`
+        /// synchronously; this flag keeps those per-frame callbacks from being
+        /// mistaken for a user pan (which would pop the "Search here" button) and is
+        /// cleared, along with `isApplyingRegion`, when the glide completes.
+        private var isGliding = false
         /// Identity of the last applied region request, so the same region can be
         /// re-framed but an unchanged one isn't reapplied every update pass.
         private var appliedRegionID: UUID?
@@ -1276,6 +1313,11 @@ extension CourseMapView {
             // the shot-arc overlay so it redraws once at the new projection, then
             // idles itself back to paused.
             arcOverlay?.resumeTicking()
+            // Our own per-frame hole glide applies `setCamera(animated: false)` many
+            // times, firing this callback on every frame. Suppress all reporting for
+            // the duration; the timer clears `isGliding`/`isApplyingRegion` itself
+            // when the glide finishes.
+            if isGliding { return }
             if isApplyingRegion {
                 isApplyingRegion = false
                 hasFramedOnce = true
@@ -1969,21 +2011,84 @@ extension CourseMapView {
                     heading: heading
                 )
                 if animated {
-                    // MapKit's default `setCamera(animated:)` duration is quite
-                    // brisk; wrapping the call in an explicit `NSAnimationContext`
-                    // makes MapKit adopt that duration, so the hole-to-hole glide is
-                    // slower and easier to follow. `allowsImplicitAnimation` lets the
-                    // camera change ride the context's timing.
-                    NSAnimationContext.runAnimationGroup { ctx in
-                        ctx.duration = Self.holeCameraDuration
-                        ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                        ctx.allowsImplicitAnimation = true
-                        map.setCamera(camera, animated: true)
-                    }
+                    // Drive the glide ourselves frame-by-frame with
+                    // `setCamera(animated: false)`. MapKit's built-in
+                    // `setCamera(animated: true)` runs implicit CoreAnimation across
+                    // the whole annotation container, so removing the outgoing hole's
+                    // shot markers mid-flight smears every glyph. See `animateHoleCamera`.
+                    animateHoleCamera(to: camera, on: map, duration: Self.holeCameraDuration)
                 } else {
                     map.setCamera(camera, animated: false)
                 }
             }
+        }
+
+        /// Glides the camera to `target` over `duration` by interpolating the pose on
+        /// a 60 Hz timer and applying each frame with `setCamera(animated: false)`.
+        /// Ported from golf-gen's `animatePitch`. This is the ANTI-GHOSTING core:
+        /// MapKit's `setCamera(animated: true)` animates the annotation container
+        /// implicitly, so any marker add/remove during the flight (changing holes
+        /// with shots on the outgoing hole) leaves trails on every glyph. Applying
+        /// each interpolated frame with `animated: false` means MapKit performs no
+        /// implicit annotation animation — each frame is a discrete snapshot — so the
+        /// markers track cleanly and never ghost.
+        private func animateHoleCamera(to target: MKMapCamera, on map: MKMapView, duration: TimeInterval) {
+            cameraTimer?.invalidate()
+            cameraTimer = nil
+
+            let startCenter = map.camera.centerCoordinate
+            let startDist = map.camera.centerCoordinateDistance
+            let startPitch = map.camera.pitch
+            let startHeading = map.camera.heading
+            let endCenter = target.centerCoordinate
+            let endDist = target.centerCoordinateDistance
+            let endPitch = target.pitch
+            let endHeading = target.heading
+
+            // Interpolate heading along the shorter arc so the camera never spins the
+            // long way around (e.g. 350° → 10° goes +20°, not −340°).
+            var headingDelta = (endHeading - startHeading).truncatingRemainder(dividingBy: 360)
+            if headingDelta > 180 { headingDelta -= 360 }
+            if headingDelta < -180 { headingDelta += 360 }
+            // Distance is interpolated GEOMETRICALLY (linear in log space): a linear
+            // lerp over a range that spans more than ~10× (e.g. the footprint view
+            // into the first hole) holds the camera high for most of the glide then
+            // rushes the final zoom, reading as "pan-then-snap-zoom". A constant
+            // per-step zoom ratio reads as one smooth continuous descent.
+            let distRatio = startDist > 0 ? endDist / startDist : 1
+
+            isGliding = true
+            let start = CACurrentMediaTime()
+            let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self, weak map] timer in
+                MainActor.assumeIsolated {
+                    guard let self, let map else { timer.invalidate(); return }
+                    let raw = duration > 0 ? (CACurrentMediaTime() - start) / duration : 1
+                    let p = min(max(raw, 0), 1)
+                    // Smootherstep (quintic) ease-in-out — C²-continuous.
+                    let e = p * p * p * (p * (p * 6 - 15) + 10)
+                    let lat = startCenter.latitude + (endCenter.latitude - startCenter.latitude) * e
+                    let lon = startCenter.longitude + (endCenter.longitude - startCenter.longitude) * e
+                    let heading = (startHeading + headingDelta * e).truncatingRemainder(dividingBy: 360)
+                    let cam = MKMapCamera(
+                        lookingAtCenter: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                        fromDistance: startDist * pow(distRatio, e),
+                        pitch: startPitch + (endPitch - startPitch) * CGFloat(e),
+                        heading: heading < 0 ? heading + 360 : heading
+                    )
+                    map.setCamera(cam, animated: false)
+                    // Keep the shot-arc overlay tracking the in-flight camera.
+                    self.arcOverlay?.resumeTicking()
+                    if p >= 1 {
+                        timer.invalidate()
+                        self.cameraTimer = nil
+                        self.isGliding = false
+                        self.isApplyingRegion = false
+                        self.hasFramedOnce = true
+                    }
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            cameraTimer = timer
         }
 
         /// How long the tilted per-hole camera glide takes, in seconds. Bumped well
