@@ -230,13 +230,24 @@ fileprivate final class ShotArcOverlayView: NSView {
 
     /// The shot segments to draw. Setting rebuilds on the next tick.
     var segments: [ArcSegment] = [] {
-        didSet { tick() }
+        didSet { geometryFingerprint = nil; tick() }
     }
 
     private static let shadowAlphaMin: CGFloat = 0.08
     private static let shadowAlphaMax: CGFloat = 0.5
 
     private var arcDisplayLink: CADisplayLink?
+    /// Fingerprint of the last geometry actually pushed to the layers — the
+    /// projected screen points of every segment. The arc is recomputed every tick
+    /// (so it follows MapKit's in-flight pan/zoom animation, which `map.convert`
+    /// reflects live even while `map.camera` still reads the target), but the
+    /// GPU-touching layer writes (`arcLayer.path = …`, `applyShadow`) are skipped
+    /// when those points are unchanged. Reassigning identical CALayer geometry at
+    /// 60 Hz otherwise keeps the Metal compositor busy every frame and makes the
+    /// map's annotation views ghost/float during interaction. Keyed off the
+    /// PROJECTED points (not `map.camera`) so a still map skips writes without the
+    /// during-animation freeze that a camera fingerprint caused.
+    private var geometryFingerprint: [CGFloat]?
 
     private let arcLayer: CAShapeLayer = {
         let l = CAShapeLayer()
@@ -289,6 +300,9 @@ fileprivate final class ShotArcOverlayView: NSView {
         arcLayer.contentsScale = scale
         shadowContainer.frame = bounds
         for s in shadowSegments { s.contentsScale = scale }
+        // Bounds changed: the projected points move, so force the next tick to
+        // repush rather than compare against a stale fingerprint.
+        geometryFingerprint = nil
         tick()
     }
 
@@ -296,28 +310,34 @@ fileprivate final class ShotArcOverlayView: NSView {
 
     @objc private func tick() {
         guard let map = mapView else {
-            arcLayer.path = nil
-            clearShadow()
+            if geometryFingerprint != nil || arcLayer.path != nil {
+                geometryFingerprint = nil
+                arcLayer.path = nil
+                clearShadow()
+            }
             return
         }
 
-        // Per §7 of docs/shot-arc-rendering.md: the arc is recomputed on EVERY
-        // display-link tick — deliberately NOT gated behind a camera fingerprint.
-        // MapKit animates pan/pitch/zoom internally (inertial fling, pinch easing)
-        // between its region-changed callbacks, and during those animations
-        // `map.camera` reports the *target* camera, not the in-flight interpolated
-        // one. A fingerprint keyed off `map.camera` therefore reads "unchanged"
-        // mid-animation, freezes the arc, and lets it drift behind the map until
-        // the animation settles and snaps. Recomputing every frame from the live
-        // projection (`map.convert`) pins the arc rigidly to its endpoints. Cost
-        // is bounded by recycling the shadow segment layers instead of allocating.
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        defer { CATransaction.commit() }
-
+        // Per §7 of docs/shot-arc-rendering.md the arc geometry is recomputed on
+        // EVERY tick from the live projection (`map.convert`), so it tracks
+        // MapKit's internal pan/pitch/zoom animation — during which `map.camera`
+        // reports the *target*, not the in-flight, camera. But the GPU-touching
+        // layer writes below are gated on a fingerprint of the resulting projected
+        // points: on a still map the points don't change, so we skip the writes.
+        // Reassigning identical CALayer geometry at 60 Hz keeps the Metal
+        // compositor churning every frame and makes the map's annotation views
+        // ghost/float during interaction. (The gate is keyed off the projected
+        // points, NOT `map.camera`, so a settled map skips writes without the
+        // mid-animation freeze/drift a camera fingerprint would cause.)
         guard !segments.isEmpty else {
-            arcLayer.path = nil
-            clearShadow()
+            if geometryFingerprint != nil || arcLayer.path != nil {
+                geometryFingerprint = nil
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                arcLayer.path = nil
+                clearShadow()
+                CATransaction.commit()
+            }
             return
         }
 
@@ -329,8 +349,12 @@ fileprivate final class ShotArcOverlayView: NSView {
         // dark at takeoff/landing and faint under the apex.
         let combined = CGMutablePath()
         var shadowSpecs: [(path: CGPath, alpha: CGFloat)] = []
+        var fingerprint: [CGFloat] = []
         for seg in segments {
             guard let g = arcGeometry(for: seg, on: map) else { continue }
+            fingerprint.append(g.start.x); fingerprint.append(g.start.y)
+            fingerprint.append(g.ctrl.x); fingerprint.append(g.ctrl.y)
+            fingerprint.append(g.end.x); fingerprint.append(g.end.y)
             let arc = CGMutablePath()
             arc.move(to: g.start)
             arc.addQuadCurve(to: g.end, control: g.ctrl)
@@ -352,8 +376,17 @@ fileprivate final class ShotArcOverlayView: NSView {
                 prev = next
             }
         }
+
+        // Nothing moved on screen since the last push → skip the layer writes so
+        // the compositor stays idle and the markers don't ghost.
+        if let last = geometryFingerprint, last == fingerprint { return }
+        geometryFingerprint = fingerprint
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         arcLayer.path = combined
         applyShadow(shadowSpecs)
+        CATransaction.commit()
     }
 
     private struct ArcGeom {
