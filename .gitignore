@@ -6,3 +6,4 @@ build
 .derived
 profiles
 .DS_Store
+*readiness.md

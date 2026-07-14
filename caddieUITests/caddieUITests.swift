@@ -435,4 +435,91 @@ final class caddieUITests: XCTestCase {
         )
         wait(for: [cleared], timeout: 10)
     }
+
+    // MARK: - Complete a hole at par
+
+    /// End-to-end automation: choose a multi-course facility, enter Play mode,
+    /// navigate to hole 9, then record exactly `par` shots via the hidden
+    /// `addShotButton` and confirm the shot count matches par.
+    ///
+    /// Network/OSM-backed like the other play tests, so it skips gracefully when
+    /// the target hole has no parsed geometry (no par, no shot recording).
+    @MainActor
+    func testCompleteHoleAtPar() throws {
+        guard selectFirstCourse(query: "Balboa Park Championship Course") else { return }
+
+        // Enter Play mode.
+        app.buttons["modeToggleButton"].click()
+
+        let holeTitle = app.descendants(matching: .any)["holeTitleMenu"].firstMatch
+        XCTAssertTrue(
+            holeTitle.waitForExistence(timeout: 10),
+            "Entering Play mode should show the hole title."
+        )
+
+        // Wait for hole geometry to load. The hole title Menu surfaces its
+        // selection as `value` (via `.accessibilityValue`), never `label`.
+        let hasHoles = NSPredicate(format: "value BEGINSWITH 'Hole '")
+        let holesReady = expectation(for: hasHoles, evaluatedWith: holeTitle)
+        let holesOutcome = XCTWaiter().wait(for: [holesReady], timeout: 20)
+        try XCTSkipUnless(
+            holesOutcome == .completed,
+            "Selected course has no OSM hole geometry; nothing to play."
+        )
+
+        // Navigate to hole 9 using the next-hole chevron. Stop early if the course
+        // has fewer holes (next button disables at the end).
+        let nextButton = app.buttons["holeNextButton"]
+        XCTAssertTrue(nextButton.waitForExistence(timeout: 5))
+        for _ in 0..<8 {
+            guard nextButton.isEnabled else { break }
+            let before = (holeTitle.value as? String) ?? ""
+            nextButton.click()
+            let advanced = expectation(
+                for: NSPredicate(format: "value != %@", before),
+                evaluatedWith: holeTitle
+            )
+            wait(for: [advanced], timeout: 10)
+        }
+        try XCTSkipUnless(
+            (holeTitle.value as? String) == "Hole 9",
+            "Course does not have a hole 9 to complete."
+        )
+
+        // Read the par for this hole. The par value Text surfaces its content as
+        // the element's accessibility `value`.
+        let parValue = app.descendants(matching: .any)["parStatValue"].firstMatch
+        XCTAssertTrue(parValue.waitForExistence(timeout: 10), "Play pane should show a par row.")
+        let parString = (parValue.value as? String) ?? ""
+        guard let par = Int(parString) else {
+            throw XCTSkip("Hole 9 has no par data; cannot complete it at par.")
+        }
+        XCTAssertGreaterThan(par, 0, "Par should be a positive number.")
+
+        // Record exactly `par` shots via the hidden UI-automation hook. The hook
+        // is a hidden button bound to ⇧⌘P (a `.hidden()` button isn't hittable by a
+        // click, so it's driven by its keyboard shortcut, like the nav/undo hooks).
+        let addShot = app.descendants(matching: .any)["addShotButton"].firstMatch
+        XCTAssertTrue(
+            addShot.waitForExistence(timeout: 10),
+            "Play pane should expose the add-shot automation button."
+        )
+
+        let shotCount = app.descendants(matching: .any)["shotCountLabel"].firstMatch
+        for i in 1...par {
+            app.typeKey("p", modifierFlags: [.command, .shift])
+            let reached = expectation(
+                for: NSPredicate(format: "value == %@", "\(i)"),
+                evaluatedWith: shotCount
+            )
+            wait(for: [reached], timeout: 10)
+        }
+
+        // Completed the hole in exactly par shots.
+        XCTAssertEqual(
+            (shotCount.value as? String),
+            "\(par)",
+            "Recording `par` shots should leave exactly `par` shots on the hole."
+        )
+    }
 }

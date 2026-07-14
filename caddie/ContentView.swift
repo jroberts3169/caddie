@@ -628,6 +628,15 @@ struct ContentView: View {
         shotsByHole[id] = nil
     }
 
+    /// Records a shot at the current hole's pin (its last coordinate). Used only by
+    /// UI automation via the hidden `addShotButton`; normal play records shots by
+    /// clicking the map. No-op when the hole has no geometry.
+    private func addShotAtCurrentHolePin() {
+        guard courseHoles.indices.contains(currentHoleIndex),
+              let pin = courseHoles[currentHoleIndex].coordinates.last else { return }
+        addShotToCurrentHole(CLLocationCoordinate2D(latitude: pin.lat, longitude: pin.lon))
+    }
+
     /// Removes the most recently recorded shot on the currently focused hole, e.g.
     /// in response to cmd+z. No-op when the hole has no shots.
     private func undoLastShot() {
@@ -736,7 +745,8 @@ struct ContentView: View {
             currentHoleIndex: $currentHoleIndex,
             shots: currentHoleShots,
             onClearShots: clearCurrentHoleShots,
-            onUndoShot: undoLastShot
+            onUndoShot: undoLastShot,
+            onAddShotAtPin: addShotAtCurrentHolePin
         )
     }
 
