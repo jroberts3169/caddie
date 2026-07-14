@@ -35,6 +35,7 @@ the settings window in
   - [5.1 Hole Navigation Header](#51-hole-navigation-header)
   - [5.2 Hole Stats](#52-hole-stats)
   - [5.3 Shots Section](#53-shots-section)
+  - [5.4 Finish Hole Section](#54-finish-hole-section)
 - [6. Overlay Settings Window](#6-overlay-settings-window)
 - [7. Behaviors](#7-behaviors)
   - [7.1 Selection](#71-selection)
@@ -414,8 +415,15 @@ presented from [ContentView.swift](../caddie/ContentView.swift#L250-L262).
 │  ① Shot 1    120 yd │  ← Shot Row
 │  ② Shot 2     85 yd │
 │  [ Clear All Shots ] │  ← Clear Shots Button
+├──────────────────────┤
+│  [ Finish Hole ]     │  ← Finish Hole Button
 └──────────────────────┘
 ```
+
+> Once the hole is marked complete the Finish Hole Button is replaced by a
+> **Hole Complete Summary** (e.g. "4 strokes · Par") plus a **Reopen Hole
+> Button**; recording another shot (map click, ⇧⌘P, or undo/clear) reopens the
+> hole automatically.
 
 ### 5.1 Hole Navigation Header
 
@@ -449,6 +457,25 @@ presented from [ContentView.swift](../caddie/ContentView.swift#L250-L262).
 > A hidden **Undo Shot** command (⌘Z) removes the last shot on the focused hole
 > ([PlayDetailPane.swift](../caddie/PlayDetailPane.swift#L97-L103)). Shots are kept
 > per hole (`shotsByHole`) and reset when a new course is selected.
+
+### 5.4 Finish Hole Section
+
+Shown below the shots list whenever the focused hole has geometry. Mirrors
+golf-gen's "hole out" concept: completing a hole locks its score summary until
+reopened.
+
+| Element | Canonical name | Icon / Source | Notes |
+| --- | --- | --- | --- |
+| Finish button | **Finish Hole Button** | `flag.checkered` (prominent), [PlayDetailPane.swift](../caddie/PlayDetailPane.swift) | Marks the hole complete; adds a final shot to the pin first if the player isn't already there. Identifier `finishHoleButton` |
+| Completion summary | **Hole Complete Summary** | `flag.checkered`, [PlayDetailPane.swift](../caddie/PlayDetailPane.swift) | Replaces the Finish button while complete. "N strokes · Par/±X". Identifier `holeCompleteLabel` |
+| Reopen button | **Reopen Hole Button** | `arrow.uturn.backward`, [PlayDetailPane.swift](../caddie/PlayDetailPane.swift) | Reopens a completed hole for editing. Identifier `reopenHoleButton` |
+
+> **Right-clicking the focused hole's pin** on the map finishes the hole — the
+> same action as the Finish Hole Button, hit-tested at the map level in
+> [CourseMapView.swift](../caddie/CourseMapView.swift) (`handleMapRightClick`).
+> Only the current hole's pin is a target; other pins and empty spots are no-ops.
+> A hole is marked complete per OSM id in `completedHoles`; recording a shot
+> removes it from that set (auto-reopen), and the set resets on course switch.
 
 
 ## 6. Overlay Settings Window

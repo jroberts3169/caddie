@@ -471,7 +471,7 @@ final class caddieUITests: XCTestCase {
         // has fewer holes (next button disables at the end).
         let nextButton = app.buttons["holeNextButton"]
         XCTAssertTrue(nextButton.waitForExistence(timeout: 5))
-        for _ in 0..<8 {
+        for _ in 0..<3 {
             guard nextButton.isEnabled else { break }
             let before = (holeTitle.value as? String) ?? ""
             nextButton.click()
@@ -482,8 +482,8 @@ final class caddieUITests: XCTestCase {
             wait(for: [advanced], timeout: 10)
         }
         try XCTSkipUnless(
-            (holeTitle.value as? String) == "Hole 9",
-            "Course does not have a hole 9 to complete."
+            (holeTitle.value as? String) == "Hole 4",
+            "Course does not have a hole 4 to complete."
         )
 
         // Read the par for this hole. The par value Text surfaces its content as
@@ -492,7 +492,7 @@ final class caddieUITests: XCTestCase {
         XCTAssertTrue(parValue.waitForExistence(timeout: 10), "Play pane should show a par row.")
         let parString = (parValue.value as? String) ?? ""
         guard let par = Int(parString) else {
-            throw XCTSkip("Hole 9 has no par data; cannot complete it at par.")
+            throw XCTSkip("Hole 4 has no par data; cannot complete it at par.")
         }
         XCTAssertGreaterThan(par, 0, "Par should be a positive number.")
 
@@ -520,6 +520,37 @@ final class caddieUITests: XCTestCase {
             (shotCount.value as? String),
             "\(par)",
             "Recording `par` shots should leave exactly `par` shots on the hole."
+        )
+
+        // Mark the hole complete via the Finish Hole button, then confirm the
+        // completion summary appears and reports the par score.
+        let finishButton = app.descendants(matching: .any)["finishHoleButton"].firstMatch
+        XCTAssertTrue(
+            finishButton.waitForExistence(timeout: 10),
+            "Play pane should expose a Finish Hole button before the hole is complete."
+        )
+        finishButton.click()
+
+        let completeLabel = app.descendants(matching: .any)["holeCompleteLabel"].firstMatch
+        XCTAssertTrue(
+            completeLabel.waitForExistence(timeout: 10),
+            "Finishing the hole should reveal the completion summary."
+        )
+        // Already at the pin (the last shot landed there), so no extra putt is
+        // added — the score summary should read "Par".
+        XCTAssertTrue(
+            ((completeLabel.value as? String) ?? "").contains("Par"),
+            "Completing the hole in par shots should report a Par score."
+        )
+
+        // The Finish button gives way to a Reopen button while complete; reopening
+        // restores the Finish button.
+        let reopenButton = app.descendants(matching: .any)["reopenHoleButton"].firstMatch
+        XCTAssertTrue(reopenButton.waitForExistence(timeout: 5))
+        reopenButton.click()
+        XCTAssertTrue(
+            finishButton.waitForExistence(timeout: 10),
+            "Reopening the hole should restore the Finish Hole button."
         )
     }
 }
